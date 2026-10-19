@@ -1,0 +1,2 @@
+coppeliasim_zmqremoteapi_client
+matplotlib
