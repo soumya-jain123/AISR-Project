@@ -16,22 +16,14 @@ import time
 
 HEARTBEAT_DT = 0.5
 
-HELP = """Commands:
-  forward 0.3      drive forward at 0.3 m/s (top speed 1.2)
-  back 0.3         reverse at 0.3 m/s
-  left 90          turn left 90 degrees (keeps driving if already moving)
-  right 90         turn right 90 degrees
-  goto 1 0.5       drive to position x=1, y=0.5 (metres)
-  drive 0.3 0.5    drive at 0.3 m/s while turning at 0.5 rad/s (+ left, - right; max 2)
-  stop             stop the robot
-  estop            emergency stop: stops and locks the robot
-  reset            release the emergency stop
-  status           where the robot is and what it is doing
-  pose             last position received here, and how late it arrived
-  delay 300        add 300 ms of artificial network delay (0 to turn off)
-  restart          restart the simulation, robot back at its start
-  clear            clear the window
-  help, quit"""
+# Commands handled here in the client. The robot's own commands come from the server, because they
+# depend on which robot is being controlled.
+LOCAL_HELP = [
+    "pose             last position received here, and how late it arrived",
+    "delay 300        add 300 ms of artificial network delay (0 to turn off)",
+    "clear            clear the window",
+    "help, quit",
+]
 
 
 class DelayLine:
@@ -146,7 +138,21 @@ def main():
     p.add_argument("--delay", type=float, default=0, help="one-way delay in ms")
     a = p.parse_args()
 
+    ui = {"robot": "robot", "help": [], "delay": a.delay}
+
+    def print_help():
+        print(f"{BOLD}Commands for the {ui['robot']}{RESET}")
+        for line in ui["help"] + LOCAL_HELP:
+            print("  " + line)
+
     def show(msg):
+        if msg["type"] == "help":   # robot connected or switched: new header and command list
+            ui["robot"], ui["help"] = msg["robot"], msg["lines"]
+            header(ui["delay"])
+            print("\r\033[2K", end="")
+            print_help()
+            print(">> ", end="", flush=True)
+            return
         late = (time.time() - msg["ts"]) * 1000
         note = f"  {DIM}[arrived {late:.0f} ms late]{RESET}" if late >= 50 else ""
         print(f"\r\033[2K{BOLD}<<{RESET} {msg['text']}{note}\n>> ", end="", flush=True)
@@ -154,13 +160,12 @@ def main():
     def header(delay_ms):
         d = f"network delay {delay_ms:.0f} ms" if delay_ms else "no added delay"
         draw_header("Robot Simulation Control Window",
-                    f"Pioneer P3-DX  ·  server {a.host}:{a.port}  ·  {d}  ·  'help' for commands, 'quit' to exit")
+                    f"{ui['robot']}  ·  server {a.host}:{a.port}  ·  {d}  ·  'help' for commands, 'quit' to exit")
 
     # Own screen like a full-screen app: the shell's scrollback comes back untouched on exit.
     # ponytail: header isn't redrawn on terminal resize; type 'clear' to redraw it.
     sys.stdout.write(f"\033[?1049h\033[2J\033[{HEADER_ROWS + 1};1H")
     header(a.delay)
-    print(f"{BOLD}Commands{RESET}\n{HELP.split(chr(10), 1)[1]}\n")
     try:
         try:
             link = Link(a.host, a.port, a.delay, show)
@@ -180,10 +185,10 @@ def main():
             if word in ("quit", "exit"):
                 break
             if word == "help":
-                print(HELP)
+                print_help()
             elif word == "clear":
                 sys.stdout.write(f"\033[r\033[2J\033[{HEADER_ROWS + 1};1H")
-                header(link.out.delay * 1000)
+                header(ui["delay"])
             elif word == "pose":
                 fb = link.fb
                 if fb:
@@ -196,6 +201,7 @@ def main():
                 try:
                     ms = float(line.split()[1])
                     link.set_delay(ms)
+                    ui["delay"] = ms
                     header(ms)
                     print(f"Network delay set to {ms:.0f} ms each way." if ms else "Network delay turned off.")
                 except (IndexError, ValueError):

@@ -1,7 +1,7 @@
-"""Robot Server: TCP commands in, Pioneer P3-DX in CoppeliaSim moves, feedback out.
+"""Robot Server: TCP commands in, a robot in CoppeliaSim moves, feedback out.
 
 Protocol: one JSON object per line, every message has "ts" (time.time() when sent).
-Run:  python server.py [--port 5555]
+Run:  python server.py [--port 5555] [--robot pioneer]
 """
 import argparse
 import json
@@ -14,9 +14,6 @@ import traceback
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
-WHEEL_R = 0.0975        # P3-DX wheel radius (m)
-AXLE = 0.331            # distance between wheels (m)
-MAX_V = 1.2             # m/s
 TURN_W = 0.8            # rad/s used by left/right
 MAX_W = 2.0             # rad/s; much faster spins tip the robot over
 HEARTBEAT_TIMEOUT = 1.5 # s
@@ -25,7 +22,30 @@ FEEDBACK_DT = 0.1       # feedback period (s)
 GOTO_TOL = 0.05         # m
 BRAKE_T = 0.6           # s; robot coasts ~0.5 m from 1.2 m/s, so check where it will be this far ahead
 SIM_TIMEOUT = 3.0       # s without a reply from CoppeliaSim = assume it crashed
-EDGE_MARGIN = 0.4       # stop this far from the floor edge (m); robot is ~0.45 m long, braking takes a few cm
+CAMERA_FILL = 0.4       # after a robot switch, zoom so the robot fills this share of the view
+EDGE_GAP = 0.15         # extra gap (m) kept between the robot's body and the floor edge
+
+# Robots the operator can switch between. All are two-wheeled (differential drive), so they share one
+# command set. radius/axle were measured by driving each model in CoppeliaSim 4.10.
+# max_v is a sensible top speed for each robot; tune freely.
+# ponytail: only differential-drive robots; an arm would need its own command set and controller.
+ROBOTS = {
+    "pioneer":  dict(name="Pioneer P3-DX", model="pioneer p3dx.ttm", base="/PioneerP3DX",
+                     left="/PioneerP3DX/leftMotor", right="/PioneerP3DX/rightMotor",
+                     radius=0.0952, axle=0.364, max_v=1.2),
+    "epuck":    dict(name="e-puck", model="e-puck.ttm", base="/ePuck",
+                     left="/ePuck/leftJoint", right="/ePuck/rightJoint",
+                     radius=0.0212, axle=0.060, max_v=0.13),
+    "dr12":     dict(name="dr12", model="dr12.ttm", base="/dr12",
+                     left="/dr12/leftJoint_", right="/dr12/rightJoint_",
+                     radius=0.0430, axle=0.172, max_v=0.4),
+    "dr20":     dict(name="dr20", model="dr20.ttm", base="/dr20",
+                     left="/dr20/leftWheelJoint_", right="/dr20/rightWheelJoint_",
+                     radius=0.0417, axle=0.252, max_v=0.5),
+    "linebot":  dict(name="Line follower", model="line follower.ttm", base="/LineTracer",
+                     left="/LineTracer/DynamicLeftJoint", right="/LineTracer/DynamicRightJoint",
+                     radius=0.0270, axle=0.119, max_v=0.3),
+}
 
 IDLE, MOVING, COMM_LOST, ESTOP = "IDLE", "MOVING", "COMM_LOST", "ESTOP_LATCHED"
 
@@ -35,16 +55,61 @@ def wrap(a):
 
 
 class Robot:
-    """Thin wrapper over the sim. Every sim call goes through one lock (ZMQ client is not thread-safe)."""
+    """Thin wrapper over the sim for one two-wheeled robot at a time.
+    Every sim call goes through one lock (the ZMQ client is not thread-safe)."""
 
-    def __init__(self):
+    def __init__(self, key=None):
         self.lock = threading.Lock()
         self.sim = RemoteAPIClient().require("sim")
-        self.body = self.sim.getObject("/PioneerP3DX")
-        self.left = self.sim.getObject("/PioneerP3DX/leftMotor")
-        self.right = self.sim.getObject("/PioneerP3DX/rightMotor")
-        self.start()
-        # Safe area = floor size minus a margin. Falls back to the default 5x5 m floor.
+        self.models = self.sim.getStringParam(self.sim.stringparam_resourcesdir) + "/models/robots/mobile/"
+        self.stop_sim()
+        # Use a robot already in the scene if there is one (and none was asked for), else load one.
+        found = [k for k, r in ROBOTS.items() if self.find(r["base"]) is not None]
+        if key is None and found:
+            self.attach(found[0])
+        else:
+            self.load(key or "pioneer")
+        self.start_sim()
+
+    def find(self, path):
+        try:
+            return self.sim.getObject(path)
+        except Exception:
+            return None
+
+    def stop_sim(self):
+        self.sim.stopSimulation()
+        while self.sim.getSimulationState() != self.sim.simulation_stopped:
+            time.sleep(0.05)
+
+    def start_sim(self):
+        # Real-time mode, otherwise CoppeliaSim runs several times faster than the wall clock our timings use.
+        self.sim.setBoolParam(self.sim.boolparam_realtime_simulation, True)
+        self.sim.startSimulation()
+
+    def attach(self, key):
+        """Take control of robot `key`, which must already be in the scene (simulation stopped)."""
+        self.key, self.spec = key, ROBOTS[key]
+        self.body = self.sim.getObject(self.spec["base"])
+        self.left = self.sim.getObject(self.spec["left"])
+        self.right = self.sim.getObject(self.spec["right"])
+        # Some model files are saved with the wheels already spinning (the e-puck at ~0.05 m/s), so zero them.
+        self.sim.setJointTargetVelocity(self.left, 0)
+        self.sim.setJointTargetVelocity(self.right, 0)
+        # Models ship with their own behaviour scripts (obstacle avoidance etc.) that would fight our commands.
+        for o in self.sim.getObjectsInTree(self.body):
+            if self.sim.getObjectType(o) == self.sim.sceneobject_script:
+                self.sim.removeObjects([o])
+        # Some models' base frame isn't z-up, so remember which local axis points up for the tip-over check.
+        m = self.sim.getObjectMatrix(self.body, -1)
+        self.up = max(range(3), key=lambda i: abs(m[8 + i]))
+        self.up_sign = 1 if m[8 + self.up] > 0 else -1
+        # Safe area = floor minus the robot's size and a gap. Falls back to the default 5x5 m floor.
+        size = max(abs(self.sim.getObjectFloatParam(self.body, p)) for p in (
+            self.sim.objfloatparam_modelbbox_min_x, self.sim.objfloatparam_modelbbox_max_x,
+            self.sim.objfloatparam_modelbbox_min_y, self.sim.objfloatparam_modelbbox_max_y,
+            self.sim.objfloatparam_modelbbox_min_z, self.sim.objfloatparam_modelbbox_max_z))
+        margin = size + EDGE_GAP
         try:
             box = self.sim.getObject("/Floor/box")
             cx, cy, _ = self.sim.getObjectPosition(box, -1)
@@ -52,7 +117,26 @@ class Robot:
             hy = self.sim.getObjectFloatParam(box, self.sim.objfloatparam_objbbox_max_y)
         except Exception:
             cx, cy, hx, hy = 0, 0, 2.5, 2.5
-        self.area = (cx - hx + EDGE_MARGIN, cx + hx - EDGE_MARGIN, cy - hy + EDGE_MARGIN, cy + hy - EDGE_MARGIN)
+        self.area = (cx - hx + margin, cx + hx - margin, cy - hy + margin, cy + hy - margin)
+
+    def load(self, key):
+        """Replace the current robot with a fresh `key` from CoppeliaSim's model library (simulation stopped)."""
+        if getattr(self, "body", None) is not None:
+            self.sim.removeModel(self.body)
+        self.sim.loadModel(self.models + ROBOTS[key]["model"])
+        self.attach(key)
+
+    def switch(self, key):
+        with self.lock:
+            self.stop_sim()
+            self.load(key)
+            self.start_sim()
+            # Zoom the main view onto the new robot; small ones like the e-puck are invisible from afar.
+            # CAMERA_FILL = share of the view the robot takes up.
+            try:
+                self.sim.cameraFitToView(0, [self.body], 0, CAMERA_FILL)
+            except Exception:
+                pass   # headless CoppeliaSim has no view; driving still works
 
     def inside(self, x, y):
         x0, x1, y0, y1 = self.area
@@ -63,37 +147,34 @@ class Robot:
         x0, x1, y0, y1 = self.area
         return (x < x0 and vx < -0.01) or (x > x1 and vx > 0.01) or (y < y0 and vy < -0.01) or (y > y1 and vy > 0.01)
 
-    def start(self):
-        self.restart()
-
     def restart(self):
-        """Stop, put the robot back at its start pose, and run in real-time mode
-        (otherwise CoppeliaSim runs several times faster than the wall clock our timings use)."""
+        """Stop and start again: the robot goes back to where it was when the simulation started."""
         with self.lock:
-            self.sim.stopSimulation()
-            while self.sim.getSimulationState() != self.sim.simulation_stopped:
-                time.sleep(0.05)
-            self.sim.setBoolParam(self.sim.boolparam_realtime_simulation, True)
-            self.sim.startSimulation()
+            self.stop_sim()
+            self.start_sim()
 
     def drive(self, v, w):
         """v: forward m/s, w: turn rad/s (positive = left)."""
-        v = max(-MAX_V, min(MAX_V, v))
+        r, axle, max_v = self.spec["radius"], self.spec["axle"], self.spec["max_v"]
+        v = max(-max_v, min(max_v, v))
         w = max(-MAX_W, min(MAX_W, w))
         with self.lock:
-            self.sim.setJointTargetVelocity(self.left, (v - w * AXLE / 2) / WHEEL_R)
-            self.sim.setJointTargetVelocity(self.right, (v + w * AXLE / 2) / WHEEL_R)
+            self.sim.setJointTargetVelocity(self.left, (v - w * axle / 2) / r)
+            self.sim.setJointTargetVelocity(self.right, (v + w * axle / 2) / r)
 
     def pose(self):
-        """(x, y, z, yaw, vx, vy, tipped, running) in world frame."""
+        """(x, y, z, yaw, vx, vy, tipped, running) in world frame.
+        Position is the point between the wheels; heading is perpendicular to the wheel axle,
+        which works for every model whatever its base frame looks like."""
         with self.lock:
-            x, y, z = self.sim.getObjectPosition(self.body, -1)
-            # Upright test from the body's z axis: matrix element [10] is its world-z component.
+            a = self.sim.getObjectPosition(self.left, -1)
+            b = self.sim.getObjectPosition(self.right, -1)
             m = self.sim.getObjectMatrix(self.body, -1)
-            yaw = self.sim.getObjectOrientation(self.body, -1)[2]
             lin, _ = self.sim.getObjectVelocity(self.body)
             running = self.sim.getSimulationState() != self.sim.simulation_stopped
-        return x, y, z, yaw, lin[0], lin[1], m[10] < 0.5, running
+        x, y, z = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2
+        yaw = math.atan2(b[0] - a[0], a[1] - b[1])
+        return x, y, z, yaw, lin[0], lin[1], self.up_sign * m[8 + self.up] < 0.5, running
 
 
 def at(x, y):
@@ -180,6 +261,8 @@ class Server:
         if not parts:
             return
         name, args = parts[0].lower(), parts[1:]
+        if name == "robot":   # takes a name, not numbers
+            return self.robot_command(args)
         try:
             nums = [float(a) for a in args]
         except ValueError:
@@ -234,10 +317,12 @@ class Server:
         if self.sim_stopped:
             return self.say("The simulation is stopped in CoppeliaSim. Type 'restart' to start it again.")
 
+        max_v = self.robot.spec["max_v"]
         cur_v = self.motion[1] if self.motion and self.motion[0] in ("vel", "turn") else 0.0
         if name in ("forward", "back"):
-            v = min(abs(nums[0]), MAX_V)
-            clip = f" (you asked for {abs(nums[0]):g} m/s; {MAX_V} m/s is the robot's top speed)" if abs(nums[0]) > MAX_V else ""
+            v = min(abs(nums[0]), max_v)
+            clip = f" (you asked for {abs(nums[0]):g} m/s; {max_v} m/s is the {self.robot.spec['name']}'s top speed)" \
+                if abs(nums[0]) > max_v else ""
             if name == "forward":
                 self.start_motion(("vel", v, 0.0), f"Moving forward at {v:.2f} m/s{clip}.")
             else:
@@ -258,11 +343,53 @@ class Server:
             self.start_motion(("goto", tx, ty), f"Driving to {at(tx, ty)}, {d:.2f} m away.")
         elif name == "drive":   # raw velocity, also used by study.py
             v, w = nums
-            vc, wc = max(-MAX_V, min(MAX_V, v)), max(-MAX_W, min(MAX_W, w))
-            clip = f" (limited from {v:g} m/s, {w:g} rad/s: the robot tops out at {MAX_V} m/s and {MAX_W} rad/s)" \
+            vc, wc = max(-max_v, min(max_v, v)), max(-MAX_W, min(MAX_W, w))
+            clip = f" (limited from {v:g} m/s, {w:g} rad/s: the robot tops out at {max_v} m/s and {MAX_W} rad/s)" \
                 if (vc, wc) != (v, w) else ""
             turn = "straight" if wc == 0 else f"turning {'left' if wc > 0 else 'right'} at {abs(wc):.2f} rad/s"
             self.start_motion(("vel", vc, wc), f"Driving at {vc:.2f} m/s, {turn}{clip}.")
+
+    def robot_command(self, args):
+        if not args:
+            names = ", ".join(f"{k} ({r['name']})" for k, r in ROBOTS.items())
+            return self.say(f"You are controlling the {self.robot.spec['name']}. Available robots: {names}. "
+                            "Type 'robot <name>' to switch, e.g. 'robot epuck'.")
+        key = args[0].lower()
+        if key not in ROBOTS:
+            return self.say(f"There is no robot called '{key}'. Type 'robot' to see the list.")
+        if key == self.robot.key:
+            return self.say(f"You are already controlling the {ROBOTS[key]['name']}.")
+        if self.state == ESTOP:
+            return self.say("The emergency stop is on. Type 'reset' before switching robots.")
+        self.halt(IDLE)
+        self.robot.switch(key)
+        self.last_tick = time.time()
+        self.estop_ts = self.estop_stopped_ts = None
+        self.fell, self.sim_stopped = None, False
+        self.run += 1
+        x, y, _, yaw, *_ = self.robot.pose()
+        self.pose = (x, y, yaw)
+        self.say(f"Switched to the {self.robot.spec['name']}. It is stopped at {self.here()}.")
+        self.send_help()
+
+    def send_help(self):
+        """The command list depends on the robot, so the server tells the client what to show."""
+        r = self.robot.spec
+        lines = [
+            f"forward 0.1      drive forward at 0.1 m/s (top speed {r['max_v']})",
+            "back 0.1         reverse at 0.1 m/s",
+            "left 90          turn left 90 degrees (keeps driving if already moving)",
+            "right 90         turn right 90 degrees",
+            "goto 1 0.5       drive to position x=1, y=0.5 (metres)",
+            f"drive 0.1 0.5    drive at 0.1 m/s while turning at 0.5 rad/s (+ left, - right; max {MAX_W})",
+            "stop             stop the robot",
+            "estop            emergency stop: stops and locks the robot",
+            "reset            release the emergency stop",
+            "status           where the robot is and what it is doing",
+            "robot            list robots; 'robot epuck' switches to another one",
+            "restart          restart the simulation, robot back at its start",
+        ]
+        self.send({"type": "help", "robot": r["name"], "lines": lines})
 
     def status(self):
         x, y, _, yaw, vx, vy, *_ = self.robot.pose()
@@ -336,7 +463,7 @@ class Server:
                 self.robot.drive(v, math.copysign(min(abs(w), 2 * abs(err) + 0.1), err))
         elif kind == "goto":
             _, tx, ty = self.motion
-            v, w, done = goto_control(x, y, yaw, tx, ty)
+            v, w, done = goto_control(x, y, yaw, tx, ty, min(0.4, self.robot.spec["max_v"]))
             if done:
                 self.halt(IDLE)
                 self.say(f"Arrived at {at(tx, ty)} ({math.hypot(tx - x, ty - y) * 100:.0f} cm off target).")
@@ -355,7 +482,7 @@ class Server:
     def die(self, reason):
         log("FATAL: " + reason)
         self.say("Lost contact with the simulator, so the robot server is shutting down. "
-                 "Reopen CoppeliaSim and the scene, then start server.py again."
+                 "Reopen CoppeliaSim, then start server.py again."
                  if "CoppeliaSim" in reason else "The robot server hit an internal error and is shutting down. "
                  "See the server window for details.", "fatal")
         time.sleep(0.2)   # let the message go out
@@ -374,7 +501,8 @@ class Server:
                 if self.state == COMM_LOST:
                     self.set_state(IDLE)
                 log(f"operator connected from {addr[0]}")
-                self.say(f"Connected to the robot. {self.status()}")
+                self.send_help()
+                self.say(f"Connected to the {self.robot.spec['name']}. {self.status()}")
             threading.Thread(target=self.reader, args=(conn,), daemon=True).start()
 
     def reader(self, conn):
@@ -408,17 +536,18 @@ def goto_control(x, y, yaw, tx, ty, v_max=0.4):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=5555)
+    p.add_argument("--robot", choices=ROBOTS, help="robot to load (default: the one in the scene, else pioneer)")
     a = p.parse_args()
     try:   # RemoteAPIClient would hang forever if CoppeliaSim isn't running, so check first
         socket.create_connection(("127.0.0.1", 23000), timeout=2).close()
     except OSError:
-        raise SystemExit("Can't reach CoppeliaSim on port 23000. Open CoppeliaSim and the scene first.")
+        raise SystemExit("Can't reach CoppeliaSim on port 23000. Open CoppeliaSim first.")
     try:   # grab the port before touching the sim, so a second server can't restart the running one
         srv = socket.create_server(("0.0.0.0", a.port))
     except OSError:
         raise SystemExit(f"Port {a.port} is already in use: another server.py is probably still running. "
                          f"Close it (Ctrl-C in its window, or: pkill -f server.py) and try again.")
-    server = Server(Robot())
+    server = Server(Robot(a.robot))
     threading.Thread(target=server.loop, daemon=True).start()
     threading.Thread(target=server.sim_watchdog, daemon=True).start()
     try:
