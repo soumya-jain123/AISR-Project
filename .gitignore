@@ -1,0 +1,16 @@
+DOCS/*.pdf
+!docs/
+!docs/**
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+results/*.csv
+!results/delay_experiment_summary.csv
+!results/*.png
+!results/*.md
