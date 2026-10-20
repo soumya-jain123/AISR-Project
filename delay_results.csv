@@ -1,0 +1,9 @@
+one_way_delay_s,overshoot_pct,settling_time_s,stable,open_loop_final_x
+0.0,0.0,3.18,True,2.0
+0.1,0.0,2.6,True,2.04
+0.2,4.31,3.18,True,2.1
+0.4,23.83,14.02,True,2.2
+0.6,43.83,never,False,2.29
+0.8,63.83,never,False,2.4
+1.0,83.83,never,False,2.5
+1.5,133.83,never,False,2.75

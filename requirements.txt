@@ -1,0 +1,5 @@
+matplotlib
+# optional, for CoppeliaSim backend:
+# coppeliasim-zmqremoteapi-client
+# optional, for MQTT extension:
+# paho-mqtt
