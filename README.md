@@ -141,6 +141,15 @@ python client/operator_client.py
    python client/operator_client.py
    ```
 
+#### Mode C: Multiplayer Backend (Mock Mode)
+```bash
+python multiplayer/run_multiplayer.py --mock
+```
+- Health Check: `http://127.0.0.1:8000/api/health`
+- Readiness Probe: `http://127.0.0.1:8000/api/ready`
+- Complete developer guide: [DOCS/MULTIPLAYER_DEV_GUIDE.md](DOCS/MULTIPLAYER_DEV_GUIDE.md)
+
+
 ---
 
 ## 6. Running Network Delay Experiments
@@ -179,6 +188,11 @@ AISR-Project/
 │   ├── sim_driver.py       # CoppeliaSim Pioneer P3-DX ZeroMQ driver
 │   ├── robot_server.py     # TCP server with priority E-Stop dispatch
 │   └── run_server.py       # Server entrypoint with auto-fallback
+├── multiplayer/            # Multiplayer backend application (Module 1+)
+│   ├── app.py              # FastAPI app with health & readiness probes
+│   ├── config.py           # Environment-based configuration model
+│   ├── sim_check.py        # Non-blocking simulation readiness checker
+│   └── run_multiplayer.py  # Multiplayer server runner
 ├── client/
 │   ├── heartbeat.py        # 0.5 s periodic heartbeat sender thread
 │   ├── logger.py           # CSV telemetry & timestamp logger
