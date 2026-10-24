@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+.env
+bridge_log.csv
+teleop_log.csv

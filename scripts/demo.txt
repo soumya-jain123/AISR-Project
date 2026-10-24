@@ -1,0 +1,16 @@
+# Demo script: run with  python teleop.py --script scripts/demo.txt
+status
+speed 0.3
+forward
+wait 1.5
+sensors
+stop
+left 90
+wait 2
+goto 1.0 1.0
+wait 6
+status
+estop
+forward
+reset
+stop
