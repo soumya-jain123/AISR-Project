@@ -4,8 +4,35 @@ Supports environment variables and command-line overrides without hardcoding.
 """
 
 import os
-from typing import List
+from typing import List, Tuple
 from pydantic import BaseModel, Field
+
+
+def get_default_robot_configs():
+    """Default robot grid for 4-player races with staggered starting positions."""
+    from multiplayer.simulation.base import RobotConfig
+
+    staggered_grid: List[Tuple[float, float, float]] = [
+        (0.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (-1.5, 0.0, 0.0),
+        (-1.5, 1.0, 0.0),
+    ]
+
+    configs = []
+    for i, pose in enumerate(staggered_grid, start=1):
+        robot_id = f"robot_{i}"
+        configs.append(
+            RobotConfig(
+                robot_id=robot_id,
+                display_name=f"Pioneer Racer {i}",
+                initial_pose=pose,
+                coppelia_base_path=f"/PioneerP3DX_{i}",
+                coppelia_left_motor_path=f"/PioneerP3DX_{i}/leftMotor",
+                coppelia_right_motor_path=f"/PioneerP3DX_{i}/rightMotor",
+            )
+        )
+    return configs
 
 
 class MultiplayerSettings(BaseModel):
@@ -24,6 +51,9 @@ class MultiplayerSettings(BaseModel):
     log_level: str = Field(default_factory=lambda: os.getenv("MP_LOG_LEVEL", "INFO").upper())
     coppelia_host: str = Field(default_factory=lambda: os.getenv("COPPELIA_HOST", "127.0.0.1"))
     coppelia_port: int = Field(default_factory=lambda: int(os.getenv("COPPELIA_PORT", "23004")))
+    sim_timeout_sec: float = Field(
+        default_factory=lambda: float(os.getenv("MP_SIM_TIMEOUT_SEC", "1.0"))
+    )
     max_players_per_room: int = Field(
         default_factory=lambda: int(os.getenv("MP_MAX_PLAYERS_PER_ROOM", "4"))
     )
