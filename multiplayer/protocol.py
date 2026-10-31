@@ -217,6 +217,17 @@ class LeaveRoomMessage(BaseMultiplayerEnvelope):
 # ============================================================================
 
 
+class WelcomeMessage(BaseMultiplayerEnvelope):
+    """Server handshake message sent immediately upon WebSocket connection."""
+
+    type: Literal["welcome"] = "welcome"
+    session_id: str = Field(pattern=ID_PATTERN, description="Server-assigned session identifier")
+    heartbeat_interval_sec: float = Field(gt=0.0, allow_inf_nan=False)
+    timeout_sec: float = Field(gt=0.0, allow_inf_nan=False)
+    server_time: float = Field(gt=0.0, allow_inf_nan=False)
+    message: str = Field(default="Connected to AISR Multiplayer Server", max_length=128)
+
+
 class CommandAckMessage(BaseMultiplayerEnvelope):
     """Server acknowledgement or rejection of a client-sent command."""
 
@@ -314,6 +325,7 @@ MultiplayerClientMessage = Annotated[
 
 MultiplayerServerMessage = Annotated[
     Union[
+        WelcomeMessage,
         CommandAckMessage,
         RobotStateBroadcastMessage,
         RoomBroadcastMessage,
@@ -334,6 +346,7 @@ MultiplayerMessage = Annotated[
         RoomResetMessage,
         JoinRoomMessage,
         LeaveRoomMessage,
+        WelcomeMessage,
         CommandAckMessage,
         RobotStateBroadcastMessage,
         RoomBroadcastMessage,

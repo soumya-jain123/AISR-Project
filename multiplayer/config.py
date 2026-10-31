@@ -57,6 +57,18 @@ class MultiplayerSettings(BaseModel):
     max_players_per_room: int = Field(
         default_factory=lambda: int(os.getenv("MP_MAX_PLAYERS_PER_ROOM", "4"))
     )
+    ws_heartbeat_interval_sec: float = Field(
+        default_factory=lambda: float(os.getenv("MP_WS_HEARTBEAT_INTERVAL_SEC", "1.0"))
+    )
+    session_timeout_sec: float = Field(
+        default_factory=lambda: float(os.getenv("MP_SESSION_TIMEOUT_SEC", "5.0"))
+    )
+    max_concurrent_connections: int = Field(
+        default_factory=lambda: int(os.getenv("MP_MAX_CONCURRENT_CONNECTIONS", "100"))
+    )
+    max_message_bytes: int = Field(
+        default_factory=lambda: int(os.getenv("MP_MAX_MESSAGE_BYTES", "16384"))
+    )
 
     def validate_sim_mode(self) -> str:
         """Ensure sim_mode is either 'mock' or 'coppelia'."""

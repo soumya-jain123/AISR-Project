@@ -1,17 +1,18 @@
 """
 FastAPI application for AISR Multiplayer Robot Racing Simulator.
-Provides health monitoring, simulation readiness checks, and sets up
-the application foundation for multiplayer session management.
+Provides health monitoring, simulation readiness checks, and the
+multiplayer WebSocket connection endpoint with per-session management.
 """
 
 from contextlib import asynccontextmanager
 import logging
 import time
 from typing import Any, Dict
-from fastapi import FastAPI, Response, status
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from multiplayer.config import get_settings
+from multiplayer.connection_manager import get_connection_manager
 from multiplayer.sim_check import check_simulation_readiness
 
 logger = logging.getLogger(__name__)
@@ -19,13 +20,18 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan context for startup and shutdown logging."""
+    """Application lifespan context for startup and shutdown logging and sweeper task."""
     settings = get_settings()
     logger.info(
         f"Starting AISR Multiplayer API on {settings.host}:{settings.port} "
         f"[Mode: {settings.sim_mode.upper()}]"
     )
+    # Start background session inactivity timeout sweeper
+    manager = get_connection_manager(settings)
+    await manager.start_timeout_sweeper(interval_sec=1.0)
     yield
+    # Stop sweeper on shutdown
+    await manager.stop_timeout_sweeper()
     logger.info("Shutting down AISR Multiplayer API")
 
 
@@ -57,6 +63,7 @@ def get_root() -> Dict[str, Any]:
         "sim_mode": settings.sim_mode,
         "health_url": "/api/health",
         "readiness_url": "/api/ready",
+        "websocket_url": "/ws/multiplayer",
     }
 
 
@@ -97,3 +104,31 @@ def get_readiness(response: Response) -> Dict[str, Any]:
         "simulation": sim_status,
         "timestamp": round(time.time(), 3),
     }
+
+
+@app.websocket("/ws/multiplayer")
+async def websocket_multiplayer_endpoint(websocket: WebSocket):
+    """
+    Multiplayer WebSocket endpoint.
+    Maintains independent session state, validates incoming protocol frames,
+    enforces sequence numbers, and sends acknowledgements / error frames.
+    """
+    manager = get_connection_manager()
+    session = await manager.register(websocket)
+    if session is None:
+        # Connection limit exceeded or registration failed
+        return
+
+    try:
+        while True:
+            raw_text = await websocket.receive_text()
+            response = await manager.process_client_message(session, raw_text)
+            if response is not None:
+                await manager.send_message(session.session_id, response)
+
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client disconnected: {session.session_id}")
+    except Exception as e:
+        logger.warning(f"Error handling WebSocket session {session.session_id}: {e}")
+    finally:
+        await manager.unregister(session.session_id, reason="Client disconnected")
