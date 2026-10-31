@@ -188,11 +188,18 @@ AISR-Project/
 │   ├── sim_driver.py       # CoppeliaSim Pioneer P3-DX ZeroMQ driver
 │   ├── robot_server.py     # TCP server with priority E-Stop dispatch
 │   └── run_server.py       # Server entrypoint with auto-fallback
-├── multiplayer/            # Multiplayer backend application (Module 1+)
-│   ├── app.py              # FastAPI app with health & readiness probes
+├── multiplayer/            # Multiplayer backend application (Modules 1-5)
+│   ├── app.py              # FastAPI app with health/readiness & WebSocket endpoint
 │   ├── config.py           # Environment-based configuration model
-│   ├── sim_check.py        # Non-blocking simulation readiness checker
+│   ├── protocol.py         # Versioned multiplayer protocol schemas & validation
+│   ├── session.py          # Isolated per-client session model & monotonic timers
+│   ├── connection_manager.py # WebSocket connection manager & timeout sweeper
+│   ├── rooms.py            # Lobby room manager, code generation & robot reservation
+│   ├── simulation/         # Multi-robot simulation abstraction & registry
 │   └── run_multiplayer.py  # Multiplayer server runner
+├── frontend/               # React + TypeScript + Three.js browser client (Module 6)
+│   ├── src/                # App shell, 3D Arena, LobbyView, and RoomView
+│   └── package.json        # Frontend scripts and dependencies
 ├── client/
 │   ├── heartbeat.py        # 0.5 s periodic heartbeat sender thread
 │   ├── logger.py           # CSV telemetry & timestamp logger
@@ -202,11 +209,7 @@ AISR-Project/
 │   └── analyze.py          # Matplotlib visualizations & table generator
 ├── scenes/
 │   └── setup_scene.py      # CoppeliaSim scene verification script
-├── tests/
-│   ├── test_protocol.py    # Packet encoding, schemas, framer tests
-│   ├── test_netdelay.py    # Delay queue timing tests
-│   ├── test_server_core.py # State machine, watchdog, and TCP tests
-│   └── test_client.py      # Client-server integration tests
+├── tests/                  # Complete test suite (114 Python tests + 13 Frontend tests)
 ├── docs/
 │   ├── MEETING_LOG.md      # Team meeting logs for Report Appendix
 │   └── CONTRIBUTIONS.md    # Contribution & writing allocation tables
@@ -215,3 +218,24 @@ AISR-Project/
 ├── requirements.txt        # Frozen Python dependencies
 └── README.md               # Project documentation
 ```
+
+---
+
+## 8. Multiplayer Robot Racing Quickstart (Modules 1–6)
+
+### 1. Launch Backend in Mock Mode
+```powershell
+.\.venv\Scripts\python.exe -m multiplayer.run_multiplayer --mock --port 8000
+```
+- API Health Check: `http://127.0.0.1:8000/api/health`
+- Simulation Readiness: `http://127.0.0.1:8000/api/ready`
+- WebSocket Endpoint: `ws://127.0.0.1:8000/ws/multiplayer`
+
+### 2. Launch Browser Frontend
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+Open `http://127.0.0.1:3000` to access the multiplayer lobby, create or join rooms via 5-character codes, view connected racers and readiness, and inspect the Three.js 3D staging grid arena.
+

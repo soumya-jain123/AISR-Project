@@ -1,0 +1,29 @@
+/* Application Shell Layout */
+.app-container {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-header {
+  border-bottom: 1px solid var(--border-color);
+  background-color: rgba(14, 19, 29, 0.8);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+
+.app-main {
+  flex: 1;
+  padding: 1.5rem 1rem;
+}
+
+.app-footer {
+  border-top: 1px solid var(--border-color);
+  background-color: var(--bg-primary);
+  padding: 1rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
