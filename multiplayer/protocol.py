@@ -49,6 +49,12 @@ class ErrorCode(str, Enum):
     ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
     ERR_ESTOP_ACTIVE = "ERR_ESTOP_ACTIVE"
     ERR_COMM_LOST = "ERR_COMM_LOST"
+    ERR_ROOM_NOT_FOUND = "ERR_ROOM_NOT_FOUND"
+    ERR_ROOM_FULL = "ERR_ROOM_FULL"
+    ERR_ALREADY_IN_ROOM = "ERR_ALREADY_IN_ROOM"
+    ERR_NOT_IN_ROOM = "ERR_NOT_IN_ROOM"
+    ERR_NO_ROBOTS_AVAILABLE = "ERR_NO_ROBOTS_AVAILABLE"
+    ERR_ROBOT_UNAVAILABLE = "ERR_ROBOT_UNAVAILABLE"
 
 
 class ControlState(str, Enum):
@@ -212,6 +218,33 @@ class LeaveRoomMessage(BaseMultiplayerEnvelope):
     room_id: str = Field(pattern=ID_PATTERN, description="Room code / ID")
 
 
+class CreateRoomMessage(BaseMultiplayerEnvelope):
+    """Client request to create a new room."""
+
+    type: Literal["create_room"] = "create_room"
+    session_id: str = Field(pattern=ID_PATTERN, description="Creator session ID")
+    name: Optional[str] = Field(default=None, max_length=64, description="Optional room name")
+    capacity: Optional[int] = Field(default=None, ge=1, le=16, description="Optional room capacity override")
+    role: Literal["driver", "spectator"] = Field(default="driver", description="Creator role")
+    display_name: Optional[str] = Field(default=None, max_length=32, description="Optional display name")
+
+
+class ListRoomsMessage(BaseMultiplayerEnvelope):
+    """Client request to list joinable rooms."""
+
+    type: Literal["list_rooms"] = "list_rooms"
+    session_id: str = Field(pattern=ID_PATTERN, description="Client session ID")
+
+
+class SetReadyMessage(BaseMultiplayerEnvelope):
+    """Client request to update player ready state in their room."""
+
+    type: Literal["set_ready"] = "set_ready"
+    session_id: str = Field(pattern=ID_PATTERN, description="Client session ID")
+    room_id: str = Field(pattern=ID_PATTERN, description="Room ID or Room Code")
+    is_ready: bool = Field(default=True, description="Player ready state")
+
+
 # ============================================================================
 # SERVER -> CLIENT MESSAGES
 # ============================================================================
@@ -305,6 +338,103 @@ class RaceStateMessage(BaseMultiplayerEnvelope):
     elapsed_sec: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
 
 
+class RoomSummaryPayload(BaseModel):
+    """Safe public metadata for listing rooms."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    room_id: str = Field(pattern=ID_PATTERN)
+    room_code: str = Field(max_length=16)
+    name: str = Field(max_length=64)
+    owner_id: str = Field(max_length=64)
+    player_count: int = Field(ge=0)
+    capacity: int = Field(ge=1)
+    status: str = Field(max_length=32)
+
+
+class RoomListMessage(BaseMultiplayerEnvelope):
+    """Server response listing available rooms."""
+
+    type: Literal["room_list"] = "room_list"
+    rooms: List[RoomSummaryPayload] = Field(default_factory=list)
+
+
+class RoomMemberPayload(BaseModel):
+    """Authoritative snapshot of a single room member."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    session_id: str = Field(pattern=ID_PATTERN)
+    display_name: str = Field(max_length=32)
+    role: str = Field(max_length=16)
+    robot_id: Optional[str] = Field(default=None, max_length=64)
+    is_ready: bool = Field(default=False)
+    is_owner: bool = Field(default=False)
+    joined_at: float = Field(ge=0.0, allow_inf_nan=False)
+
+
+class RoomSnapshotMessage(BaseMultiplayerEnvelope):
+    """Authoritative snapshot of room state sent to room members."""
+
+    type: Literal["room_snapshot"] = "room_snapshot"
+    room_id: str = Field(pattern=ID_PATTERN)
+    room_code: str = Field(max_length=16)
+    name: str = Field(max_length=64)
+    owner_id: str = Field(max_length=64)
+    capacity: int = Field(ge=1)
+    status: str = Field(max_length=32)
+    members: List[RoomMemberPayload] = Field(default_factory=list)
+
+
+class PlayerJoinedMessage(BaseMultiplayerEnvelope):
+    """Notification broadcast when a player joins a room."""
+
+    type: Literal["player_joined"] = "player_joined"
+    room_id: str = Field(pattern=ID_PATTERN)
+    session_id: str = Field(pattern=ID_PATTERN)
+    display_name: str = Field(max_length=32)
+    role: str = Field(max_length=16)
+    robot_id: Optional[str] = Field(default=None, max_length=64)
+
+
+class PlayerLeftMessage(BaseMultiplayerEnvelope):
+    """Notification broadcast when a player leaves or disconnects from a room."""
+
+    type: Literal["player_left"] = "player_left"
+    room_id: str = Field(pattern=ID_PATTERN)
+    session_id: str = Field(pattern=ID_PATTERN)
+    reason: str = Field(default="", max_length=128)
+    new_owner_id: Optional[str] = Field(default=None, max_length=64)
+
+
+class PlayerReadyMessage(BaseMultiplayerEnvelope):
+    """Notification broadcast when a player toggles their ready status."""
+
+    type: Literal["player_ready"] = "player_ready"
+    room_id: str = Field(pattern=ID_PATTERN)
+    session_id: str = Field(pattern=ID_PATTERN)
+    is_ready: bool = Field(description="New ready status")
+
+
+class RobotAssignedMessage(BaseMultiplayerEnvelope):
+    """Notification when a robot is assigned to a player."""
+
+    type: Literal["robot_assigned"] = "robot_assigned"
+    room_id: str = Field(pattern=ID_PATTERN)
+    session_id: str = Field(pattern=ID_PATTERN)
+    robot_id: str = Field(pattern=ID_PATTERN)
+
+
+class RobotUnavailableMessage(BaseMultiplayerEnvelope):
+    """Notification when an assigned robot becomes unavailable without silent reassignment."""
+
+    type: Literal["robot_unavailable"] = "robot_unavailable"
+    room_id: str = Field(pattern=ID_PATTERN)
+    session_id: str = Field(pattern=ID_PATTERN)
+    robot_id: str = Field(pattern=ID_PATTERN)
+    reason: str = Field(default="", max_length=128)
+
+
 # ============================================================================
 # DISCRIMINATED UNIONS & TYPE ADAPTERS
 # ============================================================================
@@ -319,6 +449,9 @@ MultiplayerClientMessage = Annotated[
         RoomResetMessage,
         JoinRoomMessage,
         LeaveRoomMessage,
+        CreateRoomMessage,
+        ListRoomsMessage,
+        SetReadyMessage,
     ],
     Field(discriminator="type"),
 ]
@@ -332,6 +465,13 @@ MultiplayerServerMessage = Annotated[
         SafetyEventMessage,
         ErrorMessage,
         RaceStateMessage,
+        RoomListMessage,
+        RoomSnapshotMessage,
+        PlayerJoinedMessage,
+        PlayerLeftMessage,
+        PlayerReadyMessage,
+        RobotAssignedMessage,
+        RobotUnavailableMessage,
     ],
     Field(discriminator="type"),
 ]
@@ -346,6 +486,9 @@ MultiplayerMessage = Annotated[
         RoomResetMessage,
         JoinRoomMessage,
         LeaveRoomMessage,
+        CreateRoomMessage,
+        ListRoomsMessage,
+        SetReadyMessage,
         WelcomeMessage,
         CommandAckMessage,
         RobotStateBroadcastMessage,
@@ -353,9 +496,17 @@ MultiplayerMessage = Annotated[
         SafetyEventMessage,
         ErrorMessage,
         RaceStateMessage,
+        RoomListMessage,
+        RoomSnapshotMessage,
+        PlayerJoinedMessage,
+        PlayerLeftMessage,
+        PlayerReadyMessage,
+        RobotAssignedMessage,
+        RobotUnavailableMessage,
     ],
     Field(discriminator="type"),
 ]
+
 
 _client_adapter: TypeAdapter[MultiplayerClientMessage] = TypeAdapter(MultiplayerClientMessage)
 _server_adapter: TypeAdapter[MultiplayerServerMessage] = TypeAdapter(MultiplayerServerMessage)
@@ -479,6 +630,9 @@ def parse_client_message(raw_data: str | bytes) -> MultiplayerClientMessage:
             RoomResetMessage,
             JoinRoomMessage,
             LeaveRoomMessage,
+            CreateRoomMessage,
+            ListRoomsMessage,
+            SetReadyMessage,
         ),
     ):
         raise MultiplayerProtocolError(

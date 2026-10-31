@@ -483,15 +483,20 @@ def test_enforce_max_concurrent_connections():
     manager = ConnectionManager(settings)
     set_connection_manager(manager)
 
-    client = TestClient(app)
-    with client.websocket_connect("/ws/multiplayer") as ws1:
-        _ = ws1.receive_text()
+    try:
+        client = TestClient(app)
+        with client.websocket_connect("/ws/multiplayer") as ws1:
+            _ = ws1.receive_text()
 
-        with client.websocket_connect("/ws/multiplayer") as ws2:
-            _ = ws2.receive_text()
-            assert manager.get_active_session_count() == 2
+            with client.websocket_connect("/ws/multiplayer") as ws2:
+                _ = ws2.receive_text()
+                assert manager.get_active_session_count() == 2
 
-            # 3rd connection attempt must be closed / rejected
-            with pytest.raises(Exception):
-                with client.websocket_connect("/ws/multiplayer") as ws3:
-                    _ = ws3.receive_text()
+                # 3rd connection attempt must be closed / rejected
+                with pytest.raises(Exception):
+                    with client.websocket_connect("/ws/multiplayer") as ws3:
+                        _ = ws3.receive_text()
+    finally:
+        set_settings(MultiplayerSettings())
+        set_connection_manager(None)
+

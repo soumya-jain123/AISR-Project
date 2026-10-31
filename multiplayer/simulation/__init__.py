@@ -12,7 +12,12 @@ from multiplayer.simulation.base import (
     SimulationInterface,
     RobotConfig,
 )
-from multiplayer.simulation.robot_registry import RobotInstance, RobotRegistry
+from multiplayer.simulation.robot_registry import (
+    RobotInstance,
+    RobotRegistry,
+    get_robot_registry,
+    set_robot_registry,
+)
 from multiplayer.simulation.mock_sim import MockMultiplayerSimulation
 from multiplayer.simulation.coppelia_sim import CoppeliaMultiplayerSimulation
 
@@ -25,6 +30,8 @@ __all__ = [
     "RobotConfig",
     "RobotInstance",
     "RobotRegistry",
+    "get_robot_registry",
+    "set_robot_registry",
     "MockMultiplayerSimulation",
     "CoppeliaMultiplayerSimulation",
 ]

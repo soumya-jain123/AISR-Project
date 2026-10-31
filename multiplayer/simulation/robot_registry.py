@@ -137,3 +137,25 @@ class RobotRegistry:
         """Clear all registered robots."""
         with self._lock:
             self._robots.clear()
+
+
+_global_registry: Optional[RobotRegistry] = None
+
+
+def get_robot_registry() -> RobotRegistry:
+    """Retrieve or initialize the global RobotRegistry singleton with default grid."""
+    global _global_registry
+    if _global_registry is None:
+        _global_registry = RobotRegistry()
+        from multiplayer.config import get_default_robot_configs
+
+        for cfg in get_default_robot_configs():
+            _global_registry.register(cfg)
+    return _global_registry
+
+
+def set_robot_registry(registry: Optional[RobotRegistry]) -> None:
+    """Override or reset the global RobotRegistry singleton."""
+    global _global_registry
+    _global_registry = registry
+
