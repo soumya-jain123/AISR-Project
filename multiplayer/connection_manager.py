@@ -25,14 +25,18 @@ from multiplayer.protocol import (
     PlayerLeftMessage,
     PlayerReadyMessage,
     RobotAssignedMessage,
+    RobotOperatingState,
     RobotUnavailableMessage,
     RoomListMessage,
     RoomSnapshotMessage,
+    SafetyEventMessage,
+    SafetyScope,
     WelcomeMessage,
     encode_multiplayer_message,
     now_ts,
     parse_client_message,
 )
+from multiplayer.control_service import ControlService, get_control_service
 from multiplayer.rooms import RoomManager, RoomStatus, get_room_manager
 from multiplayer.session import PlayerSession, SessionStatus
 
@@ -50,9 +54,13 @@ class ConnectionManager:
         self,
         settings: Optional[MultiplayerSettings] = None,
         room_manager: Optional[RoomManager] = None,
+        control_service: Optional[ControlService] = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.room_manager = room_manager or get_room_manager(settings=self.settings)
+        self.control_service = control_service or get_control_service(
+            settings=self.settings, room_manager=self.room_manager
+        )
         self._sessions: Dict[str, PlayerSession] = {}
         self._lock = asyncio.Lock()
         self._server_seq = 0
@@ -119,6 +127,7 @@ class ConnectionManager:
             leave_info = await self.room_manager.handle_disconnect(session_id)
             if leave_info is not None:
                 room, released_robot, new_owner = leave_info
+                self.control_service.handle_session_disconnect(session_id, released_robot)
                 # Broadcast departure to remaining room members
                 left_msg = PlayerLeftMessage(
                     seq=self._next_server_seq(),
@@ -132,6 +141,8 @@ class ConnectionManager:
                 if room.status != RoomStatus.CLOSED:
                     snap_msg = room.to_snapshot(seq=self._next_server_seq(), ts=now_ts())
                     await self.send_to_room(room.room_id, snap_msg)
+            else:
+                self.control_service.handle_session_disconnect(session_id)
         except Exception as e:
             logger.error(f"Error handling room disconnect for {session_id}: {e}")
 
@@ -401,6 +412,7 @@ class ConnectionManager:
                         ref_seq=msg.seq,
                     )
                 room, released_robot, new_owner = leave_info
+                self.control_service.handle_session_disconnect(session.session_id, released_robot)
                 left_msg = PlayerLeftMessage(
                     seq=self._next_server_seq(),
                     ts=now_ts(),
@@ -468,14 +480,78 @@ class ConnectionManager:
                 rooms=summaries,
             )
 
+        elif msg.type == "player_input":
+            return await self.control_service.handle_player_input(
+                session.session_id, msg, server_seq=self._next_server_seq()
+            )
+
+        elif msg.type == "individual_stop":
+            return await self.control_service.handle_individual_stop(
+                session.session_id, msg, server_seq=self._next_server_seq()
+            )
+
+        elif msg.type == "individual_estop":
+            resp = await self.control_service.handle_individual_estop(
+                session.session_id, msg, server_seq=self._next_server_seq()
+            )
+            if isinstance(resp, CommandAckMessage) and resp.ok:
+                room = self.room_manager.get_session_room(session.session_id)
+                if room:
+                    member = room.get_member(session.session_id)
+                    if member and member.robot_id:
+                        safety_msg = SafetyEventMessage(
+                            seq=self._next_server_seq(),
+                            ts=now_ts(),
+                            scope=SafetyScope.INDIVIDUAL,
+                            event="INDIVIDUAL_ESTOP",
+                            target_id=member.robot_id,
+                            reason=msg.reason,
+                            state=RobotOperatingState.ESTOP_LATCHED,
+                        )
+                        await self.send_to_room(room.room_id, safety_msg)
+            return resp
+
+        elif msg.type == "room_estop":
+            resp = await self.control_service.handle_room_estop(
+                session.session_id, msg, server_seq=self._next_server_seq()
+            )
+            if isinstance(resp, CommandAckMessage) and resp.ok:
+                safety_msg = SafetyEventMessage(
+                    seq=self._next_server_seq(),
+                    ts=now_ts(),
+                    scope=SafetyScope.ROOM,
+                    event="ROOM_ESTOP",
+                    target_id=msg.room_id,
+                    reason=msg.reason,
+                    state=RobotOperatingState.ESTOP_LATCHED,
+                )
+                await self.send_to_room(msg.room_id, safety_msg)
+            return resp
+
+        elif msg.type == "room_reset":
+            resp = await self.control_service.handle_room_reset(
+                session.session_id, msg, server_seq=self._next_server_seq()
+            )
+            if isinstance(resp, CommandAckMessage) and resp.ok:
+                safety_msg = SafetyEventMessage(
+                    seq=self._next_server_seq(),
+                    ts=now_ts(),
+                    scope=SafetyScope.ROOM,
+                    event="ROOM_ESTOP_RESET",
+                    target_id=msg.room_id,
+                    reason="Host reset emergency stop",
+                    state=RobotOperatingState.IDLE,
+                )
+                await self.send_to_room(msg.room_id, safety_msg)
+            return resp
+
         else:
-            # Control / E-stop messages: validated successfully; control dispatching is added in later modules
             return CommandAckMessage(
                 seq=self._next_server_seq(),
                 ts=now_ts(),
                 ref_seq=msg.seq,
                 ok=True,
-                message=f"Message '{msg.type}' validated and accepted (control dispatch pending Module 7)",
+                message=f"Message '{msg.type}' validated and accepted",
             )
 
     async def notify_robot_unavailable(self, robot_id: str, reason: str = "") -> None:

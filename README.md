@@ -188,17 +188,19 @@ AISR-Project/
 │   ├── sim_driver.py       # CoppeliaSim Pioneer P3-DX ZeroMQ driver
 │   ├── robot_server.py     # TCP server with priority E-Stop dispatch
 │   └── run_server.py       # Server entrypoint with auto-fallback
-├── multiplayer/            # Multiplayer backend application (Modules 1-5)
+├── multiplayer/            # Multiplayer backend application (Modules 1-5, 7)
 │   ├── app.py              # FastAPI app with health/readiness & WebSocket endpoint
-│   ├── config.py           # Environment-based configuration model
+│   ├── config.py           # Environment-based configuration model & rate limits
 │   ├── protocol.py         # Versioned multiplayer protocol schemas & validation
 │   ├── session.py          # Isolated per-client session model & monotonic timers
 │   ├── connection_manager.py # WebSocket connection manager & timeout sweeper
+│   ├── control_service.py  # Authoritative driving input router & safety supervisor
+│   ├── state_broadcaster.py # 20 Hz state synchronization & watchdog timer loop
 │   ├── rooms.py            # Lobby room manager, code generation & robot reservation
 │   ├── simulation/         # Multi-robot simulation abstraction & registry
 │   └── run_multiplayer.py  # Multiplayer server runner
-├── frontend/               # React + TypeScript + Three.js browser client (Module 6)
-│   ├── src/                # App shell, 3D Arena, LobbyView, and RoomView
+├── frontend/               # React + TypeScript + Three.js browser client (Modules 6-7)
+│   ├── src/                # App shell, 3D Arena with lerp, Driving Cockpit, LobbyView, and RoomView
 │   └── package.json        # Frontend scripts and dependencies
 ├── client/
 │   ├── heartbeat.py        # 0.5 s periodic heartbeat sender thread
@@ -209,10 +211,11 @@ AISR-Project/
 │   └── analyze.py          # Matplotlib visualizations & table generator
 ├── scenes/
 │   └── setup_scene.py      # CoppeliaSim scene verification script
-├── tests/                  # Complete test suite (114 Python tests + 13 Frontend tests)
+├── tests/                  # Complete test suite (124 Python tests + 21 Frontend tests)
 ├── docs/
 │   ├── MEETING_LOG.md      # Team meeting logs for Report Appendix
-│   └── CONTRIBUTIONS.md    # Contribution & writing allocation tables
+│   ├── CONTRIBUTIONS.md    # Contribution & writing allocation tables
+│   └── MULTIPLAYER_CONTROL_SYNC.md # Real-time input, watchdog & safety sync specification
 ├── results/                # CSV data logs and generated figures
 ├── IMPLEMENTATION_PLAN.md  # Detailed module-by-module breakdown
 ├── requirements.txt        # Frozen Python dependencies
@@ -221,7 +224,7 @@ AISR-Project/
 
 ---
 
-## 8. Multiplayer Robot Racing Quickstart (Modules 1–6)
+## 8. Multiplayer Robot Racing Quickstart (Modules 1–7)
 
 ### 1. Launch Backend in Mock Mode
 ```powershell
@@ -237,5 +240,11 @@ cd frontend
 npm install
 npm run dev
 ```
-Open `http://127.0.0.1:3000` to access the multiplayer lobby, create or join rooms via 5-character codes, view connected racers and readiness, and inspect the Three.js 3D staging grid arena.
+Open `http://127.0.0.1:3000` to access the multiplayer lobby:
+- **Lobby & Rooms:** Create or join rooms via 5-character codes; assign unique Pioneer P3-DX robots.
+- **Driving Controls:** Steer your assigned robot in real time using `W`/`S` (throttle), `A`/`D` (steering), `Space` (brake), or `E` (emergency stop latch).
+- **Cockpit Telemetry:** Live HUD meters displaying throttle, steering, velocity, heading, and robot operating state (`IDLE`, `MOVING`, `COMM_LOST`, `ESTOP_LATCHED`).
+- **3D Race Arena:** Real-time authoritative state interpolation across all room competitors with zero cross-room leakage.
+- **Safety Overrides:** Automatic 1.0 s communication watchdog timeout and host-level room emergency stop with authoritative reset.
+
 

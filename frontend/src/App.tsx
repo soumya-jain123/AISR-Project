@@ -3,7 +3,7 @@ import './App.css';
 import { LobbyView } from './components/LobbyView';
 import { RoomView } from './components/RoomView';
 import { MultiplayerClient } from './services/MultiplayerClient';
-import type { ConnectionStatus, RoomSnapshotMessage, RoomSummaryPayload } from './types/protocol';
+import type { ConnectionStatus, RobotStatePayload, RoomSnapshotMessage, RoomSummaryPayload } from './types/protocol';
 
 export const App: React.FC = () => {
   const client = useMemo(() => new MultiplayerClient(), []);
@@ -13,6 +13,7 @@ export const App: React.FC = () => {
   const [currentRoom, setCurrentRoom] = useState<RoomSnapshotMessage | null>(null);
   const [assignedRobotId, setAssignedRobotId] = useState<string | null>(null);
   const [activeRooms, setActiveRooms] = useState<RoomSummaryPayload[]>([]);
+  const [robotStates, setRobotStates] = useState<RobotStatePayload[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState<boolean>(false);
 
@@ -67,6 +68,18 @@ export const App: React.FC = () => {
 
     client.onRoomList = (msg) => {
       setActiveRooms(msg.rooms || []);
+    };
+
+    client.onRoomBroadcast = (msg) => {
+      setRobotStates(msg.robots || []);
+    };
+
+    client.onSafetyEvent = (msg) => {
+      if (msg.event === 'INDIVIDUAL_ESTOP' || msg.event === 'ROOM_ESTOP') {
+        setErrorMessage(`SAFETY EVENT: ${msg.event} on ${msg.target_id}: ${msg.reason}`);
+      } else if (msg.event === 'WATCHDOG_TIMEOUT') {
+        setErrorMessage(`SAFETY WATCHDOG: Comm timeout on ${msg.target_id}`);
+      }
     };
 
     client.onError = (err) => {
@@ -184,8 +197,14 @@ export const App: React.FC = () => {
             room={currentRoom}
             sessionId={sessionId || ''}
             assignedRobotId={assignedRobotId}
+            robotStates={robotStates}
             onToggleReady={handleToggleReady}
             onLeaveRoom={handleLeaveRoom}
+            onSendInput={(throttle, steering, controlState) =>
+              client.sendInput(throttle, steering, controlState)
+            }
+            onSendStop={() => client.sendStop()}
+            onSendEstop={() => client.sendEstop()}
             errorMessage={errorMessage}
           />
         ) : (

@@ -7,6 +7,7 @@ using a single shared ZeroMQ Remote API connection with bounded timeouts.
 import logging
 import math
 import socket
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from common.config import (
@@ -22,7 +23,7 @@ from multiplayer.simulation.base import (
     SimulationInterface,
     SimulationNotReadyError,
 )
-from multiplayer.simulation.robot_registry import RobotInstance, RobotRegistry
+from multiplayer.simulation.robot_registry import RobotInstance, RobotRegistry, get_robot_registry
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +45,21 @@ class CoppeliaMultiplayerSimulation(SimulationInterface):
         wheel_radius: float = PIONEER_WHEEL_RADIUS,
         track_width: float = PIONEER_TRACK_WIDTH,
         client: Optional[Any] = None,  # Supports dependency injection for tests
+        registry: Optional[RobotRegistry] = None,
     ) -> None:
         self.host = host
         self.port = port
         self.timeout_sec = timeout_sec
         self.wheel_radius = wheel_radius
         self.track_width = track_width
-        self.registry = RobotRegistry()
+        self._lock = threading.RLock()
+
+        if registry is not None:
+            self.registry = registry
+        elif robots is not None:
+            self.registry = RobotRegistry()
+        else:
+            self.registry = get_robot_registry()
 
         self._injected_client = client
         self._client: Optional[Any] = None
@@ -59,7 +68,8 @@ class CoppeliaMultiplayerSimulation(SimulationInterface):
 
         if robots:
             for cfg in robots:
-                self.registry.register(cfg)
+                if not self.registry.contains(cfg.robot_id):
+                    self.registry.register(cfg)
 
     def connect(self) -> bool:
         """
@@ -178,119 +188,124 @@ class CoppeliaMultiplayerSimulation(SimulationInterface):
         Send wheel speed commands directly to the targeted robot's motors in CoppeliaSim.
         Guarantees isolation: command for Robot A never targets Robot B.
         """
-        if not self._connected or not self._sim:
-            raise SimulationNotReadyError("coppelia", "Simulation not connected")
+        with self._lock:
+            if not self._connected or not self._sim:
+                raise SimulationNotReadyError("coppelia", "Simulation not connected")
 
-        robot = self.registry.require(robot_id)
-        if not robot.is_available:
-            raise RobotUnavailableError(robot_id, robot.metadata.get("unavailable_reason", "Not available"))
+            robot = self.registry.require(robot_id)
+            if not robot.is_available:
+                raise RobotUnavailableError(robot_id, robot.metadata.get("unavailable_reason", "Not available"))
 
-        if robot.operating_state == RobotOperatingState.ESTOP_LATCHED:
-            return False
+            if robot.operating_state == RobotOperatingState.ESTOP_LATCHED:
+                return False
 
-        handles = robot.metadata.get("handles", {})
-        left_h = handles.get("left_motor")
-        right_h = handles.get("right_motor")
-        if left_h is None or right_h is None:
-            raise RobotUnavailableError(robot_id, "Missing motor handles")
+            handles = robot.metadata.get("handles", {})
+            left_h = handles.get("left_motor")
+            right_h = handles.get("right_motor")
+            if left_h is None or right_h is None:
+                raise RobotUnavailableError(robot_id, "Missing motor handles")
 
-        clamped_throttle = max(-1.0, min(float(throttle), 1.0))
-        clamped_steering = max(-1.0, min(float(steering), 1.0))
+            clamped_throttle = max(-1.0, min(float(throttle), 1.0))
+            clamped_steering = max(-1.0, min(float(steering), 1.0))
 
-        target_v = clamped_throttle * MAX_LINEAR_SPEED
-        target_w = clamped_steering * MAX_ANGULAR_SPEED
-        wl, wr = self._speeds_to_wheel_rates(target_v, target_w)
+            target_v = clamped_throttle * MAX_LINEAR_SPEED
+            target_w = clamped_steering * MAX_ANGULAR_SPEED
+            wl, wr = self._speeds_to_wheel_rates(target_v, target_w)
 
-        try:
-            self._sim.setJointTargetVelocity(left_h, float(wl))
-            self._sim.setJointTargetVelocity(right_h, float(wr))
+            try:
+                self._sim.setJointTargetVelocity(left_h, float(wl))
+                self._sim.setJointTargetVelocity(right_h, float(wr))
 
-            robot.velocities = (target_v, target_w)
-            if abs(target_v) > 1e-4 or abs(target_w) > 1e-4:
-                robot.operating_state = RobotOperatingState.MOVING
-            else:
+                robot.velocities = (target_v, target_w)
+                if abs(target_v) > 1e-4 or abs(target_w) > 1e-4:
+                    robot.operating_state = RobotOperatingState.MOVING
+                else:
+                    robot.operating_state = RobotOperatingState.IDLE
+                return True
+
+            except Exception as e:
+                logger.error(f"Error commanding robot '{robot_id}': {e}")
+                robot.is_available = False
+                robot.metadata["unavailable_reason"] = str(e)
+                raise RobotUnavailableError(robot_id, str(e)) from e
+
+    def stop_robot(self, robot_id: str, reason: str = "") -> bool:
+        with self._lock:
+            if not self._connected or not self._sim:
+                return False
+
+            robot = self.registry.require(robot_id)
+            handles = robot.metadata.get("handles", {})
+            left_h = handles.get("left_motor")
+            right_h = handles.get("right_motor")
+
+            if left_h is not None and right_h is not None:
+                try:
+                    self._sim.setJointTargetVelocity(left_h, 0.0)
+                    self._sim.setJointTargetVelocity(right_h, 0.0)
+                except Exception as e:
+                    logger.warning(f"Error stopping robot '{robot_id}': {e}")
+
+            robot.velocities = (0.0, 0.0)
+            if robot.operating_state != RobotOperatingState.ESTOP_LATCHED:
                 robot.operating_state = RobotOperatingState.IDLE
             return True
 
-        except Exception as e:
-            logger.error(f"Error commanding robot '{robot_id}': {e}")
-            robot.is_available = False
-            robot.metadata["unavailable_reason"] = str(e)
-            raise RobotUnavailableError(robot_id, str(e)) from e
-
-    def stop_robot(self, robot_id: str, reason: str = "") -> bool:
-        if not self._connected or not self._sim:
-            return False
-
-        robot = self.registry.require(robot_id)
-        handles = robot.metadata.get("handles", {})
-        left_h = handles.get("left_motor")
-        right_h = handles.get("right_motor")
-
-        if left_h is not None and right_h is not None:
-            try:
-                self._sim.setJointTargetVelocity(left_h, 0.0)
-                self._sim.setJointTargetVelocity(right_h, 0.0)
-            except Exception as e:
-                logger.warning(f"Error stopping robot '{robot_id}': {e}")
-
-        robot.velocities = (0.0, 0.0)
-        if robot.operating_state != RobotOperatingState.ESTOP_LATCHED:
-            robot.operating_state = RobotOperatingState.IDLE
-        return True
-
     def stop_all(self, reason: str = "") -> None:
-        for robot_id in self.registry.get_all_ids():
-            self.stop_robot(robot_id, reason=reason)
+        with self._lock:
+            for robot_id in self.registry.get_all_ids():
+                self.stop_robot(robot_id, reason=reason)
 
     def reset_robot(self, robot_id: str, pose: Optional[Tuple[float, float, float]] = None) -> bool:
         """
         Teleport robot back to starting position in CoppeliaSim scene and halt motion.
         """
-        if not self._connected or not self._sim:
-            raise SimulationNotReadyError("coppelia", "Simulation not connected")
+        with self._lock:
+            if not self._connected or not self._sim:
+                raise SimulationNotReadyError("coppelia", "Simulation not connected")
 
-        robot = self.registry.require(robot_id)
-        handles = robot.metadata.get("handles", {})
-        base_h = handles.get("base")
-        if base_h is None:
-            raise RobotUnavailableError(robot_id, "Missing base handle")
+            robot = self.registry.require(robot_id)
+            handles = robot.metadata.get("handles", {})
+            base_h = handles.get("base")
+            if base_h is None:
+                raise RobotUnavailableError(robot_id, "Missing base handle")
 
-        target_pose = pose if pose is not None else robot.config.initial_pose
-        self.stop_robot(robot_id, reason="Resetting pose")
+            target_pose = pose if pose is not None else robot.config.initial_pose
+            self.stop_robot(robot_id, reason="Resetting pose")
 
-        try:
-            # CoppeliaSim coordinates: [x, y, z] and [alpha, beta, gamma] (radians)
-            self._sim.setObjectPosition(base_h, -1, [target_pose[0], target_pose[1], 0.1])
-            self._sim.setObjectOrientation(base_h, -1, [0.0, 0.0, target_pose[2]])
-            robot.pose = target_pose
-            robot.velocities = (0.0, 0.0)
-            robot.operating_state = RobotOperatingState.IDLE
-            return True
-        except Exception as e:
-            logger.error(f"Failed to reset pose for robot '{robot_id}': {e}")
-            raise RobotUnavailableError(robot_id, f"Pose reset failed: {e}") from e
+            try:
+                # CoppeliaSim coordinates: [x, y, z] and [alpha, beta, gamma] (radians)
+                self._sim.setObjectPosition(base_h, -1, [target_pose[0], target_pose[1], 0.1])
+                self._sim.setObjectOrientation(base_h, -1, [0.0, 0.0, target_pose[2]])
+                robot.pose = target_pose
+                robot.velocities = (0.0, 0.0)
+                robot.operating_state = RobotOperatingState.IDLE
+                return True
+            except Exception as e:
+                logger.error(f"Failed to reset pose for robot '{robot_id}': {e}")
+                raise RobotUnavailableError(robot_id, f"Pose reset failed: {e}") from e
 
     def get_robot_state(self, robot_id: str) -> RobotStatePayload:
-        if not self._connected or not self._sim:
-            raise SimulationNotReadyError("coppelia", "Simulation not connected")
+        with self._lock:
+            if not self._connected or not self._sim:
+                raise SimulationNotReadyError("coppelia", "Simulation not connected")
 
-        robot = self.registry.require(robot_id)
-        if not robot.is_available:
-            raise RobotUnavailableError(robot_id, robot.metadata.get("unavailable_reason", "Not available"))
+            robot = self.registry.require(robot_id)
+            if not robot.is_available:
+                raise RobotUnavailableError(robot_id, robot.metadata.get("unavailable_reason", "Not available"))
 
-        handles = robot.metadata.get("handles", {})
-        base_h = handles.get("base")
-        if base_h is None:
-            raise RobotUnavailableError(robot_id, "Missing base handle")
+            handles = robot.metadata.get("handles", {})
+            base_h = handles.get("base")
+            if base_h is None:
+                raise RobotUnavailableError(robot_id, "Missing base handle")
 
-        try:
-            pos = self._sim.getObjectPosition(base_h, -1)
-            ori = self._sim.getObjectOrientation(base_h, -1)
-            robot.pose = (pos[0], pos[1], ori[2])
-            return robot.to_payload()
-        except Exception as e:
-            logger.warning(f"Failed reading pose for robot '{robot_id}': {e}")
-            robot.is_available = False
-            robot.metadata["unavailable_reason"] = str(e)
-            raise RobotUnavailableError(robot_id, f"Pose read error: {e}") from e
+            try:
+                pos = self._sim.getObjectPosition(base_h, -1)
+                ori = self._sim.getObjectOrientation(base_h, -1)
+                robot.pose = (pos[0], pos[1], ori[2])
+                return robot.to_payload()
+            except Exception as e:
+                logger.warning(f"Failed reading pose for robot '{robot_id}': {e}")
+                robot.is_available = False
+                robot.metadata["unavailable_reason"] = str(e)
+                raise RobotUnavailableError(robot_id, f"Pose read error: {e}") from e

@@ -3,6 +3,7 @@ Unit and integration tests for Operator Client and TelemetryLogger.
 """
 
 import os
+import socket
 import tempfile
 import time
 import pytest
@@ -41,7 +42,9 @@ def test_telemetry_logger():
 
 
 def test_operator_client_server_integration():
-    test_port = 55234
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        test_port = s.getsockname()[1]
     driver = MockRobotDriver()
     server = RobotServer(
         driver=driver,

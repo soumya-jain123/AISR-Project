@@ -227,7 +227,6 @@ class RoomManager:
         for inst in instances:
             if inst.is_available and inst.assigned_player_id is None:
                 inst.assigned_player_id = session_id
-                inst.is_available = False
                 logger.info(f"Reserved robot '{inst.robot_id}' for session '{session_id}'")
                 return inst.robot_id
         return None
@@ -241,7 +240,6 @@ class RoomManager:
         if robot is not None:
             if robot.assigned_player_id == session_id:
                 robot.assigned_player_id = None
-                robot.is_available = True
                 logger.info(f"Released robot '{robot_id}' reservation for session '{session_id}'")
 
     async def create_room(

@@ -29,6 +29,10 @@ export const ErrorCode = {
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
 
+export type ControlState = 'active' | 'neutral' | 'released';
+export type RobotOperatingState = 'IDLE' | 'MOVING' | 'COMM_LOST' | 'ESTOP_LATCHED';
+export type SafetyScope = 'individual' | 'room';
+
 
 // ---------------------------------------------------------------------------
 // Base Envelope
@@ -83,13 +87,51 @@ export interface ListRoomsMessage extends BaseMultiplayerEnvelope {
   session_id: string;
 }
 
+export interface PlayerInputMessage extends BaseMultiplayerEnvelope {
+  type: 'player_input';
+  session_id: string;
+  throttle: number;
+  steering: number;
+  control_state?: ControlState;
+}
+
+export interface IndividualStopMessage extends BaseMultiplayerEnvelope {
+  type: 'individual_stop';
+  session_id: string;
+  reason?: string;
+}
+
+export interface IndividualEstopMessage extends BaseMultiplayerEnvelope {
+  type: 'individual_estop';
+  session_id: string;
+  reason?: string;
+}
+
+export interface RoomEstopMessage extends BaseMultiplayerEnvelope {
+  type: 'room_estop';
+  session_id: string;
+  room_id: string;
+  reason?: string;
+}
+
+export interface RoomResetMessage extends BaseMultiplayerEnvelope {
+  type: 'room_reset';
+  session_id: string;
+  room_id: string;
+}
+
 export type ClientMessage =
   | ClientHeartbeatMessage
   | CreateRoomMessage
   | JoinRoomMessage
   | LeaveRoomMessage
   | SetReadyMessage
-  | ListRoomsMessage;
+  | ListRoomsMessage
+  | PlayerInputMessage
+  | IndividualStopMessage
+  | IndividualEstopMessage
+  | RoomEstopMessage
+  | RoomResetMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Client Payloads and Messages
@@ -194,6 +236,35 @@ export interface RobotUnavailableMessage extends BaseMultiplayerEnvelope {
   reason: string;
 }
 
+export interface RobotStatePayload {
+  robot_id: string;
+  player_id?: string | null;
+  x: number;
+  y: number;
+  theta: number;
+  linear_vel: number;
+  angular_vel: number;
+  state: RobotOperatingState;
+  lap: number;
+  checkpoint: number;
+}
+
+export interface RoomBroadcastMessage extends BaseMultiplayerEnvelope {
+  type: 'room_broadcast';
+  room_id: string;
+  race_state: string;
+  robots: RobotStatePayload[];
+}
+
+export interface SafetyEventMessage extends BaseMultiplayerEnvelope {
+  type: 'safety_event';
+  scope: SafetyScope;
+  event: string;
+  target_id: string;
+  reason: string;
+  state: RobotOperatingState;
+}
+
 export type ServerMessage =
   | WelcomeMessage
   | CommandAckMessage
@@ -204,4 +275,6 @@ export type ServerMessage =
   | PlayerLeftMessage
   | PlayerReadyMessage
   | RobotAssignedMessage
-  | RobotUnavailableMessage;
+  | RobotUnavailableMessage
+  | RoomBroadcastMessage
+  | SafetyEventMessage;

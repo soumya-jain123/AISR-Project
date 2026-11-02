@@ -8,14 +8,17 @@ import { PROTOCOL_VERSION } from '../types/protocol';
 import type {
   ClientMessage,
   ConnectionStatus,
+  ControlState,
   ErrorMessage,
   PlayerJoinedMessage,
   PlayerLeftMessage,
   PlayerReadyMessage,
   RobotAssignedMessage,
   RobotUnavailableMessage,
+  RoomBroadcastMessage,
   RoomListMessage,
   RoomSnapshotMessage,
+  SafetyEventMessage,
   ServerMessage,
   WelcomeMessage,
 } from '../types/protocol';
@@ -46,7 +49,11 @@ export class MultiplayerClient {
   public onPlayerReady?: MessageHandler<PlayerReadyMessage>;
   public onRobotAssigned?: MessageHandler<RobotAssignedMessage>;
   public onRobotUnavailable?: MessageHandler<RobotUnavailableMessage>;
+  public onRoomBroadcast?: MessageHandler<RoomBroadcastMessage>;
+  public onSafetyEvent?: MessageHandler<SafetyEventMessage>;
   public onError?: ErrorHandler;
+
+  private lastInputSentTime = 0;
 
   constructor(wsUrl?: string) {
     this.wsUrl = wsUrl;
@@ -228,6 +235,14 @@ export class MultiplayerClient {
         this.onRoomList?.(msg);
         break;
 
+      case 'room_broadcast':
+        this.onRoomBroadcast?.(msg);
+        break;
+
+      case 'safety_event':
+        this.onSafetyEvent?.(msg);
+        break;
+
       case 'error':
         this.onError?.(msg);
         break;
@@ -322,6 +337,89 @@ export class MultiplayerClient {
       seq: this.nextSeq(),
       ts: this.nowTs(),
       session_id: this.sessionId,
+    });
+  }
+
+  public sendInput(
+    throttle: number,
+    steering: number,
+    controlState: ControlState = 'active'
+  ): boolean {
+    if (!this.sessionId || !this.currentRoom || !this.assignedRobotId) return false;
+
+    const now = performance.now();
+    const isNeutral =
+      controlState === 'neutral' ||
+      controlState === 'released' ||
+      (Math.abs(throttle) < 1e-4 && Math.abs(steering) < 1e-4);
+
+    // Apply client-side rate limiting (max 30 Hz -> 33ms interval), unless releasing/neutral
+    if (!isNeutral && now - this.lastInputSentTime < 33) {
+      return false;
+    }
+    this.lastInputSentTime = now;
+
+    const clampedThrottle = Math.max(-1.0, Math.min(1.0, throttle));
+    const clampedSteering = Math.max(-1.0, Math.min(1.0, steering));
+
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: 'player_input',
+      seq: this.nextSeq(),
+      ts: this.nowTs(),
+      session_id: this.sessionId,
+      throttle: Number(clampedThrottle.toFixed(3)),
+      steering: Number(clampedSteering.toFixed(3)),
+      control_state: controlState,
+    });
+  }
+
+  public sendStop(reason: string = 'Normal stop'): boolean {
+    if (!this.sessionId || !this.currentRoom) return false;
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: 'individual_stop',
+      seq: this.nextSeq(),
+      ts: this.nowTs(),
+      session_id: this.sessionId,
+      reason,
+    });
+  }
+
+  public sendEstop(reason: string = 'Player emergency stop'): boolean {
+    if (!this.sessionId || !this.currentRoom) return false;
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: 'individual_estop',
+      seq: this.nextSeq(),
+      ts: this.nowTs(),
+      session_id: this.sessionId,
+      reason,
+    });
+  }
+
+  public sendRoomEstop(reason: string = 'Room emergency stop'): boolean {
+    if (!this.sessionId || !this.currentRoom) return false;
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: 'room_estop',
+      seq: this.nextSeq(),
+      ts: this.nowTs(),
+      session_id: this.sessionId,
+      room_id: this.currentRoom.room_id,
+      reason,
+    });
+  }
+
+  public sendRoomReset(): boolean {
+    if (!this.sessionId || !this.currentRoom) return false;
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: 'room_reset',
+      seq: this.nextSeq(),
+      ts: this.nowTs(),
+      session_id: this.sessionId,
+      room_id: this.currentRoom.room_id,
     });
   }
 }

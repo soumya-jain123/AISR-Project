@@ -14,24 +14,44 @@ from fastapi.middleware.cors import CORSMiddleware
 from multiplayer.config import get_settings
 from multiplayer.connection_manager import get_connection_manager
 from multiplayer.sim_check import check_simulation_readiness
+from multiplayer.simulation import get_simulation
+from multiplayer.state_broadcaster import get_state_broadcaster
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan context for startup and shutdown logging and sweeper task."""
+    """Application lifespan context for startup and shutdown logging, simulation, and background tasks."""
     settings = get_settings()
     logger.info(
         f"Starting AISR Multiplayer API on {settings.host}:{settings.port} "
         f"[Mode: {settings.sim_mode.upper()}]"
     )
+
+    # Initialize and connect simulation backend
+    sim = get_simulation(settings)
+    sim_ok = sim.connect()
+    if not sim_ok:
+        logger.warning(f"Simulation backend [{settings.sim_mode}] did not connect on startup.")
+
     # Start background session inactivity timeout sweeper
     manager = get_connection_manager(settings)
     await manager.start_timeout_sweeper(interval_sec=1.0)
+
+    # Start background control & state synchronization broadcaster
+    broadcaster = get_state_broadcaster(settings=settings)
+    await broadcaster.start()
+
     yield
-    # Stop sweeper on shutdown
+
+    # Shutdown sequence
+    await broadcaster.stop()
     await manager.stop_timeout_sweeper()
+    try:
+        sim.disconnect()
+    except Exception:
+        pass
     logger.info("Shutting down AISR Multiplayer API")
 
 

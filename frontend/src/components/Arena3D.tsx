@@ -1,11 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import type { RoomMemberPayload } from '../types/protocol';
+import type { RobotStatePayload, RoomMemberPayload } from '../types/protocol';
 
 interface Arena3DProps {
   members?: RoomMemberPayload[];
   mySessionId?: string | null;
   myRobotId?: string | null;
+  robotStates?: RobotStatePayload[];
 }
 
 interface RobotVisualConfig {
@@ -47,7 +48,12 @@ const DEFAULT_ROBOTS: RobotVisualConfig[] = [
   },
 ];
 
-export const Arena3D: React.FC<Arena3DProps> = ({ members = [], mySessionId, myRobotId }) => {
+export const Arena3D: React.FC<Arena3DProps> = ({
+  members = [],
+  mySessionId,
+  myRobotId,
+  robotStates = [],
+}) => {
   const mountRef = useRef<HTMLDivElement>(null);
   const [webGLSupported, setWebGLSupported] = useState<boolean>(true);
   const [cameraMode, setCameraMode] = useState<'perspective' | 'top'>('perspective');
@@ -56,6 +62,18 @@ export const Arena3D: React.FC<Arena3DProps> = ({ members = [], mySessionId, myR
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const robotMeshesRef = useRef<Map<string, THREE.Group>>(new Map());
+  const targetsRef = useRef<Map<string, RobotStatePayload>>(new Map());
+
+  // Update target poses when authoritative broadcast arrives
+  useEffect(() => {
+    if (robotStates && robotStates.length > 0) {
+      robotStates.forEach((st) => {
+        targetsRef.current.set(st.robot_id, st);
+      });
+    }
+  }, [robotStates]);
+
+  const hasLiveTelemetry = (robotStates && robotStates.length > 0);
 
   // Check WebGL support on mount
   useEffect(() => {
@@ -213,13 +231,28 @@ export const Arena3D: React.FC<Arena3DProps> = ({ members = [], mySessionId, myR
       animId = requestAnimationFrame(animate);
       const elapsed = clock.getElapsedTime();
 
-      // Subtle pulse on active assigned beacons
+      // Smooth interpolation towards authoritative poses
       robotMeshesRef.current.forEach((mesh, rId) => {
         const beacon = mesh.getObjectByName('beacon');
         if (beacon) {
           const isMyBot = rId === myRobotId;
           const scale = isMyBot ? 1.0 + 0.2 * Math.sin(elapsed * 6) : 1.0;
           beacon.scale.set(scale, scale, scale);
+        }
+
+        const target = targetsRef.current.get(rId);
+        if (target) {
+          const targetX = target.x * 3;
+          const targetZ = -target.y * 3;
+          // Position lerp
+          mesh.position.x += (targetX - mesh.position.x) * 0.25;
+          mesh.position.z += (targetZ - mesh.position.z) * 0.25;
+
+          // Shortest angle rotation lerp
+          let diff = target.theta - mesh.rotation.y;
+          while (diff > Math.PI) diff -= 2 * Math.PI;
+          while (diff < -Math.PI) diff += 2 * Math.PI;
+          mesh.rotation.y += diff * 0.25;
         }
       });
 
@@ -277,10 +310,18 @@ export const Arena3D: React.FC<Arena3DProps> = ({ members = [], mySessionId, myR
         </button>
       </div>
 
-      {/* Grid Staging Status Banner */}
+      {/* Grid Staging / Live Synchronization Status Banner */}
       <div className="absolute top-3 left-3 bg-slate-900/85 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-700 text-xs font-mono text-slate-300 flex items-center gap-2">
-        <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-        <span>Staging Grid (Multi-Robot Visual Arena)</span>
+        <span
+          className={`w-2 h-2 rounded-full ${
+            hasLiveTelemetry ? 'bg-cyan-400 animate-ping' : 'bg-emerald-400 animate-pulse'
+          }`}
+        />
+        <span>
+          {hasLiveTelemetry
+            ? 'Authoritative Live State Sync (20 Hz)'
+            : 'Staging Grid (Waiting for Live Sync)'}
+        </span>
       </div>
 
       {/* Bottom Telemetry Legend & Assigned Robot HUD */}
@@ -288,6 +329,7 @@ export const Arena3D: React.FC<Arena3DProps> = ({ members = [], mySessionId, myR
         <div className="flex items-center gap-4 flex-wrap">
           {DEFAULT_ROBOTS.map((bot) => {
             const member = members.find((m) => m.robot_id === bot.id);
+            const targetState = targetsRef.current.get(bot.id);
             const isMe = bot.id === myRobotId;
             return (
               <div
@@ -300,6 +342,21 @@ export const Arena3D: React.FC<Arena3DProps> = ({ members = [], mySessionId, myR
               >
                 <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: bot.hexColor }} />
                 <span className="font-bold">{bot.id}</span>
+                {targetState && (
+                  <span
+                    className={`text-[9px] px-1 py-0.5 rounded uppercase font-bold ${
+                      targetState.state === 'ESTOP_LATCHED'
+                        ? 'bg-red-950 text-red-400 border border-red-800'
+                        : targetState.state === 'COMM_LOST'
+                        ? 'bg-amber-950 text-amber-400 border border-amber-800'
+                        : targetState.state === 'MOVING'
+                        ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
+                        : 'bg-slate-800 text-slate-400'
+                    }`}
+                  >
+                    {targetState.state}
+                  </span>
+                )}
                 <span className="text-[11px] text-slate-400">
                   {member ? `[${member.display_name}${member.is_ready ? ' ✓' : ''}]` : '(Available)'}
                 </span>

@@ -102,10 +102,25 @@ def test_valid_player_input_ack():
         welcome = parse_multiplayer_message(ws.receive_text())
         sess_id = welcome.session_id
 
+        # Join a room so session has an assigned robot
+        ws.send_text(
+            json.dumps(
+                {
+                    "v": 1,
+                    "type": "create_room",
+                    "seq": 1,
+                    "ts": time.time(),
+                    "session_id": sess_id,
+                }
+            )
+        )
+        _ = ws.receive_text()
+        _ = ws.receive_text()
+
         input_frame = {
             "v": 1,
             "type": "player_input",
-            "seq": 1,
+            "seq": 2,
             "ts": time.time(),
             "session_id": sess_id,
             "throttle": 0.6,
@@ -117,7 +132,7 @@ def test_valid_player_input_ack():
         raw_ack = ws.receive_text()
         ack = parse_multiplayer_message(raw_ack)
         assert isinstance(ack, CommandAckMessage)
-        assert ack.ref_seq == 1
+        assert ack.ref_seq == 2
         assert ack.ok is True
         assert "player_input" in ack.message
 
@@ -133,6 +148,21 @@ def test_message_isolation_between_clients():
 
         with client.websocket_connect("/ws/multiplayer") as ws2:
             w2 = parse_multiplayer_message(ws2.receive_text())
+
+            # Client 1 joins a room to get an assigned robot
+            ws1.send_text(
+                json.dumps(
+                    {
+                        "v": 1,
+                        "type": "create_room",
+                        "seq": 1,
+                        "ts": time.time(),
+                        "session_id": w1.session_id,
+                    }
+                )
+            )
+            _ = ws1.receive_text()
+            _ = ws1.receive_text()
 
             # Client 1 sends input
             ws1.send_text(

@@ -69,6 +69,34 @@ class MultiplayerSettings(BaseModel):
     max_message_bytes: int = Field(
         default_factory=lambda: int(os.getenv("MP_MAX_MESSAGE_BYTES", "16384"))
     )
+    control_rate_limit_hz: float = Field(
+        default_factory=lambda: float(os.getenv("MP_CONTROL_RATE_LIMIT_HZ", "30.0")),
+        description="Maximum accepted client control commands per second per session",
+    )
+    control_watchdog_timeout_sec: float = Field(
+        default_factory=lambda: float(os.getenv("MP_CONTROL_WATCHDOG_TIMEOUT_SEC", "1.0")),
+        description="Duration without fresh control commands before halting robot and marking COMM_LOST",
+    )
+    sim_tick_rate_hz: int = Field(
+        default_factory=lambda: int(os.getenv("MP_SIM_TICK_RATE_HZ", "30")),
+        description="Simulation physics integration step frequency in Hz",
+    )
+    state_broadcast_rate_hz: int = Field(
+        default_factory=lambda: int(os.getenv("MP_BROADCAST_RATE_HZ", "20")),
+        description="Authoritative room telemetry broadcast rate in Hz",
+    )
+    stale_telemetry_threshold_sec: float = Field(
+        default_factory=lambda: float(os.getenv("MP_STALE_TELEMETRY_THRESHOLD_SEC", "2.0")),
+        description="Threshold beyond which robot telemetry is marked stale",
+    )
+    max_linear_speed: float = Field(
+        default_factory=lambda: float(os.getenv("MP_MAX_LINEAR_SPEED", "1.2")),
+        description="Maximum robot linear speed in m/s (Pioneer P3-DX specification)",
+    )
+    max_angular_speed: float = Field(
+        default_factory=lambda: float(os.getenv("MP_MAX_ANGULAR_SPEED", "1.5")),
+        description="Maximum robot angular speed in rad/s",
+    )
 
     def validate_sim_mode(self) -> str:
         """Ensure sim_mode is either 'mock' or 'coppelia'."""

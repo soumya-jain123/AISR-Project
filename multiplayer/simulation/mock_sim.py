@@ -17,7 +17,7 @@ from multiplayer.simulation.base import (
     SimulationInterface,
     SimulationNotReadyError,
 )
-from multiplayer.simulation.robot_registry import RobotInstance, RobotRegistry
+from multiplayer.simulation.robot_registry import RobotInstance, RobotRegistry, get_robot_registry
 
 MAX_ANGULAR_SPEED = 1.5  # rad/s for differential turning
 
@@ -34,10 +34,17 @@ class MockMultiplayerSimulation(SimulationInterface):
         robots: Optional[List[RobotConfig]] = None,
         dt: float = 0.05,
         auto_step: bool = False,
+        registry: Optional[RobotRegistry] = None,
     ) -> None:
         self.dt = dt
         self.auto_step = auto_step
-        self.registry = RobotRegistry()
+
+        if registry is not None:
+            self.registry = registry
+        elif robots is not None:
+            self.registry = RobotRegistry()
+        else:
+            self.registry = get_robot_registry()
 
         self._connected = False
         self._running = False
@@ -49,8 +56,12 @@ class MockMultiplayerSimulation(SimulationInterface):
 
         if robots:
             for cfg in robots:
-                self.registry.register(cfg)
+                if not self.registry.contains(cfg.robot_id):
+                    self.registry.register(cfg)
                 self._control_inputs[cfg.robot_id] = (0.0, 0.0)
+        else:
+            for r_id in self.registry.get_all_ids():
+                self._control_inputs[r_id] = (0.0, 0.0)
 
     def connect(self) -> bool:
         with self._lock:
