@@ -69,12 +69,25 @@ class CoppeliaSimDriver(RobotDriverInterface):
             sim_time = self._sim.getSimulationTime()
             logger.info(f"Connected to CoppeliaSim ZMQ API (sim time: {sim_time:.2f}s)")
 
-            # Resolve object handles
-            self._robot_handle = self._sim.getObject(self.robot_path)
-            self._left_motor = self._sim.getObject(self.left_motor_path)
-            self._right_motor = self._sim.getObject(self.right_motor_path)
+            # Resolve object handles (with fallback aliases if needed)
+            def _resolve_obj(path: str, fallbacks: list = None):
+                try:
+                    return self._sim.getObject(path)
+                except Exception:
+                    if fallbacks:
+                        for fb in fallbacks:
+                            try:
+                                return self._sim.getObject(fb)
+                            except Exception:
+                                pass
+                    raise
+
+            self._robot_handle = _resolve_obj(self.robot_path, ["/Pioneer_p3dx", "PioneerP3DX"])
+            self._left_motor = _resolve_obj(self.left_motor_path, ["/Pioneer_p3dx/leftMotor", "./leftMotor", "/PioneerP3DX/leftMotor"])
+            self._right_motor = _resolve_obj(self.right_motor_path, ["/Pioneer_p3dx/rightMotor", "./rightMotor", "/PioneerP3DX/rightMotor"])
 
             # Check and disable conflicting demo child script if present
+            script_modified = False
             try:
                 script = self._sim.getScript(self._sim.scripttype_childscript, self._robot_handle)
                 script_text = self._sim.getScriptStringParam(script, self._sim.scriptstringparam_text)
@@ -85,14 +98,29 @@ class CoppeliaSimDriver(RobotDriverInterface):
                         self._sim.scriptstringparam_text,
                         "-- Teleoperation controlled via external Python API\nfunction sysCall_init()\nend\nfunction sysCall_actuation()\nend\nfunction sysCall_cleanup()\nend\n",
                     )
+                    script_modified = True
             except Exception as e:
                 logger.debug(f"No child script or unable to modify script: {e}")
 
-            # Ensure simulation is actively running
+            # Ensure script reload if modified during an active simulation run
             sim_state = self._sim.getSimulationState()
-            if sim_state == 0:  # simulation stopped
+            if script_modified and sim_state != 0:
+                logger.info("Restarting simulation so modified robot child script is recompiled...")
+                self._sim.stopSimulation()
+                while self._sim.getSimulationState() != 0:
+                    time.sleep(0.05)
+                self._sim.startSimulation()
+                while self._sim.getSimulationState() == 0:
+                    time.sleep(0.05)
+                # Re-fetch handles in newly started simulation
+                self._robot_handle = _resolve_obj(self.robot_path, ["/Pioneer_p3dx", "PioneerP3DX"])
+                self._left_motor = _resolve_obj(self.left_motor_path, ["/Pioneer_p3dx/leftMotor", "./leftMotor", "/PioneerP3DX/leftMotor"])
+                self._right_motor = _resolve_obj(self.right_motor_path, ["/Pioneer_p3dx/rightMotor", "./rightMotor", "/PioneerP3DX/rightMotor"])
+            elif sim_state == 0:
                 logger.info("CoppeliaSim was stopped. Automatically starting simulation...")
                 self._sim.startSimulation()
+                while self._sim.getSimulationState() == 0:
+                    time.sleep(0.05)
 
             self._is_connected = True
             logger.info(

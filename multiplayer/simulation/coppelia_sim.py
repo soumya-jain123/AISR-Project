@@ -137,6 +137,21 @@ class CoppeliaMultiplayerSimulation(SimulationInterface):
                 }
                 robot.is_available = True
                 resolved_any = True
+
+                # Disable conflicting demo child script on the robot if present
+                try:
+                    script = self._sim.getScript(self._sim.scripttype_childscript, base_h)
+                    script_text = self._sim.getScriptStringParam(script, self._sim.scriptstringparam_text)
+                    if "braitenberg" in script_text.lower() or "sysCall_actuation" in script_text:
+                        logger.info(f"Disabling default demo Braitenberg script on '{robot.robot_id}'...")
+                        self._sim.setScriptStringParam(
+                            script,
+                            self._sim.scriptstringparam_text,
+                            "-- Teleoperation controlled via external Python API\nfunction sysCall_init()\nend\nfunction sysCall_actuation()\nend\nfunction sysCall_cleanup()\nend\n",
+                        )
+                except Exception:
+                    pass
+
                 logger.info(
                     f"Resolved robot '{robot.robot_id}' -> base={base_h}, "
                     f"left={left_h}, right={right_h}"
