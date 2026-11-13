@@ -103,6 +103,9 @@ class SafetyController:
         self._motion_generation: int = 0
         self._motion_timer: Any = None
 
+        # Transport ownership tracking (prevents independent simultaneous control)
+        self._active_transport: str | None = None
+
     # -----------------------------------------------------------------------
     # Properties
     # -----------------------------------------------------------------------
@@ -117,17 +120,79 @@ class SafetyController:
     def config(self) -> SafetyConfig:
         return self._config
 
+    @property
+    def active_transport(self) -> str | None:
+        """Name of the transport currently holding control (e.g. 'TCP', 'MQTT', or None)."""
+        with self._lock:
+            return self._active_transport
+
+    # -----------------------------------------------------------------------
+    # Transport ownership policy
+    # -----------------------------------------------------------------------
+
+    def acquire_transport(self, transport: str, force: bool = False) -> tuple[bool, str]:
+        """Acquire exclusive transport control of the robot.
+
+        Parameters
+        ----------
+        transport : str
+            Identifier for the transport (e.g. 'TCP', 'MQTT').
+        force : bool, optional
+            If True, forcibly seize ownership from an existing transport,
+            halting motion and invalidating older motion timers.
+
+        Returns
+        -------
+        tuple[bool, str]
+            (success, message)
+        """
+        with self._lock:
+            if self._active_transport is None or self._active_transport == transport:
+                self._active_transport = transport
+                return True, f"Transport ownership acquired by '{transport}'."
+            if force:
+                old = self._active_transport
+                self._cancel_motion_timer()
+                self._robot.stop()
+                self._last_heartbeat = self._clock()
+                self._active_transport = transport
+                return True, f"Transport ownership transferred from '{old}' to '{transport}'."
+            return False, f"Transport ownership denied for '{transport}'. Active transport is '{self._active_transport}'."
+
+    def release_transport(self, transport: str) -> bool:
+        """Release transport control if currently held by *transport*.
+
+        Halts motion and leaves the robot stationary.
+        """
+        with self._lock:
+            if self._active_transport == transport:
+                self._cancel_motion_timer()
+                self._robot.stop()
+                self._active_transport = None
+                return True
+            return False
+
     # -----------------------------------------------------------------------
     # Heartbeat
     # -----------------------------------------------------------------------
 
-    def record_heartbeat(self) -> dict:
+    def record_heartbeat(self, transport: str | None = None) -> dict:
         """Record a heartbeat and return an ACK response.
 
         If the robot was in ``COMM_LOST``, it transitions back to
         ``IDLE`` — but it does **not** resume motion.
         """
         with self._lock:
+            if transport is not None and self._active_transport is not None and self._active_transport != transport:
+                return {
+                    "type": "HEARTBEAT_ACK",
+                    "state": self._state.value,
+                    "status": "warning",
+                    "message": (
+                        f"Heartbeat received from '{transport}', but active transport is "
+                        f"'{self._active_transport}'. Watchdog not refreshed."
+                    ),
+                }
             self._last_heartbeat = self._clock()
             if self._state == RobotState.COMM_LOST:
                 self._state = RobotState.IDLE
@@ -236,13 +301,20 @@ class SafetyController:
     # Client disconnect
     # -----------------------------------------------------------------------
 
-    def on_client_disconnect(self) -> None:
-        """Called when a client disconnects. Cancel timers and stop the robot."""
+    def on_client_disconnect(self, transport: str | None = None) -> None:
+        """Called when a client disconnects. Cancel timers, stop robot, and release transport."""
         with self._lock:
+            # If a specific transport is provided, only release if it holds ownership
+            if transport is not None and self._active_transport is not None and self._active_transport != transport:
+                return
             self._cancel_motion_timer()
             self._robot.stop()
             if self._state != RobotState.ESTOP_LATCHED:
                 self._state = RobotState.COMM_LOST
+            if transport is not None and self._active_transport == transport:
+                self._active_transport = None
+            elif transport is None:
+                self._active_transport = None
 
     # -----------------------------------------------------------------------
     # Timed motion safety
@@ -595,13 +667,16 @@ class SafetyController:
     # Command dispatcher
     # -----------------------------------------------------------------------
 
-    def dispatch(self, message: dict) -> dict:
+    def dispatch(self, message: dict, transport: str | None = None) -> dict:
         """Route a validated protocol message to the appropriate handler.
 
         Parameters
         ----------
         message : dict
             A decoded message with a ``type`` field.
+        transport : str, optional
+            Identifier of the issuing transport (e.g. 'TCP', 'MQTT').
+            Enforces transport ownership policy to prevent independent control.
 
         Returns
         -------
@@ -625,8 +700,25 @@ class SafetyController:
 
         cmd = raw_cmd.strip().upper()
 
+        # Transport ownership enforcement
+        if transport is not None and cmd != "ESTOP":
+            with self._lock:
+                if cmd not in ("STATUS", "PING", "HEARTBEAT"):
+                    if self._active_transport is None:
+                        self._active_transport = transport
+                    elif self._active_transport != transport:
+                        return {
+                            "type": "ERROR",
+                            "status": "ownership_denied",
+                            "state": self._state.value,
+                            "message": (
+                                f"Transport '{transport}' denied control. Active transport is "
+                                f"'{self._active_transport}'."
+                            ),
+                        }
+
         dispatch_table: dict[str, Callable[[], dict]] = {
-            "HEARTBEAT":  lambda: self.record_heartbeat(),
+            "HEARTBEAT":  lambda: self.record_heartbeat(transport=transport),
             "MOVE":       lambda: self.handle_move(message),
             "FORWARD":    lambda: self.handle_forward(message),
             "BACKWARD":   lambda: self.handle_backward(message),

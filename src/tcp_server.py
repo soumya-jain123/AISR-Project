@@ -58,6 +58,7 @@ def serve_client(
         The safety controller managing state and robot commands.
     """
     print(f"Connected to client: {address}")
+    controller.acquire_transport("TCP")
     conn.settimeout(SOCKET_TIMEOUT)
     buffer = MessageBuffer()
 
@@ -84,7 +85,7 @@ def serve_client(
                 if msg_type.upper() != "HEARTBEAT":
                     print(f"Received: {message}")
 
-                response: dict = controller.dispatch(message)
+                response: dict = controller.dispatch(message, transport="TCP")
                 try:
                     conn.sendall(encode_message(response))
                 except OSError:
@@ -94,7 +95,7 @@ def serve_client(
     except ConnectionResetError:
         print("Client connection reset.")
     finally:
-        controller.on_client_disconnect()
+        controller.on_client_disconnect(transport="TCP")
         conn.close()
         print(f"Client {address} disconnected. Robot stopped.")
 

@@ -1,0 +1,4 @@
+coppeliasim_zmqremoteapi_client>=2.0.4
+matplotlib>=3.8.0
+paho-mqtt>=2.0.0
+
