@@ -64,6 +64,7 @@ class Link:
         self.fb, self.fb_rx = None, 0.0   # latest feedback and when it was used here
         self.latencies = collections.deque(maxlen=50)   # one-way latency of feedback (s)
         self.alive = True
+        self.cut = False   # True = the network link is down: nothing new gets through either way (used by the study)
         self.out = DelayLine(self._send_now)
         self.inn = DelayLine(self._use)
         self.set_delay(delay_ms)
@@ -75,7 +76,8 @@ class Link:
 
     def send(self, msg):
         msg["ts"] = time.time()   # stamped when the operator issued it
-        self.out.put(msg)
+        if not self.cut:
+            self.out.put(msg)
 
     def cmd(self, text):
         self.send({"type": "cmd", "cmd": text})
@@ -94,7 +96,8 @@ class Link:
     def _reader(self):
         try:
             for line in self.sock.makefile("r"):
-                self.inn.put(json.loads(line))
+                if not self.cut:
+                    self.inn.put(json.loads(line))
         except (OSError, json.JSONDecodeError):
             pass
         self.alive = False

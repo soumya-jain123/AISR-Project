@@ -21,9 +21,17 @@ TASK_TIMEOUT = 60   # s
 OUT = "results"
 
 
+def alive(link):
+    """The server shuts down if CoppeliaSim freezes; stop instead of recording a robot that no longer moves."""
+    if not link.alive:
+        print("lost the robot server; stopping")
+        os._exit(1)
+
+
 def wait_fb(link, cond, timeout=10):
     end = time.time() + timeout
     while time.time() < end:
+        alive(link)
         if link.fb and cond(link.fb):
             return link.fb
         time.sleep(0.02)
@@ -43,6 +51,7 @@ def follow(link, waypoints):
     path, ws, t0 = [], [], time.time()
     i = 0
     while i < len(waypoints):
+        alive(link)
         if time.time() - t0 > TASK_TIMEOUT:
             link.cmd("stop")
             return path, ws, time.time() - t0, False
@@ -63,6 +72,7 @@ def settle(link, delay, path):
     """After stop, let the robot come to rest and keep recording its path."""
     end = time.time() + 1.5 + 2 * delay
     while time.time() < end:
+        alive(link)
         path.append((link.fb["x"], link.fb["y"]))
         time.sleep(0.1)
     return link.fb
@@ -92,6 +102,17 @@ def estop_test(link, delay):
     return f["estop_stopped_ts"] - t0, seen - t0   # actual stop, stop as seen by operator
 
 
+def clean(link, task):
+    """Run task(); if CoppeliaSim paused the control loop during it, run it again (up to 4 tries)."""
+    for _ in range(4):
+        before = link.fb["stalls"]
+        out = task()
+        if link.fb["stalls"] == before:
+            return out
+        print("simulator paused during the run; running it again")
+    return out
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     comm_lost = []
@@ -106,29 +127,33 @@ def main():
         comm_lost.clear()
         print(f"--- delay {ms} ms ---")
 
-        s = fresh_start(link, d)
-        start = (s["x"], s["y"])
-        target = (start[0] + 2.0, start[1] + 1.0)
-        path, ws, secs, ok = follow(link, [target])
-        final = settle(link, d, path)
-        err, over, osc = metrics(path, ws, start, target, final)
+        def goto():
+            s = fresh_start(link, d)
+            start = (s["x"], s["y"])
+            target = (start[0] + 2.0, start[1] + 1.0)
+            path, ws, secs, ok = follow(link, [target])
+            final = settle(link, d, path)
+            return path, ws, secs, ok, metrics(path, ws, start, target, final)
+        path, ws, secs, ok, (err, over, osc) = clean(link, goto)
         paths[("goto", ms)] = path
         rows.append(dict(task="goto", delay_ms=ms, ok=ok, final_error_m=err, overshoot_m=over,
                          oscillations=osc, time_s=secs))
         print(rows[-1])
 
-        s = fresh_start(link, d)
-        x0, y0 = s["x"], s["y"]
-        square = [(x0 + 1.5, y0), (x0 + 1.5, y0 + 1.5), (x0, y0 + 1.5), (x0, y0)]
-        path, ws, secs, ok = follow(link, square)
-        final = settle(link, d, path)
-        err, over, osc = metrics(path, ws, square[2], square[3], final)
+        def sq():
+            s = fresh_start(link, d)
+            x0, y0 = s["x"], s["y"]
+            square = [(x0 + 1.5, y0), (x0 + 1.5, y0 + 1.5), (x0, y0 + 1.5), (x0, y0)]
+            path, ws, secs, ok = follow(link, square)
+            final = settle(link, d, path)
+            return path, ws, secs, ok, metrics(path, ws, square[2], square[3], final)
+        path, ws, secs, ok, (err, over, osc) = clean(link, sq)
         paths[("square", ms)] = path
         rows.append(dict(task="square", delay_ms=ms, ok=ok, final_error_m=err, overshoot_m=over,
                          oscillations=osc, time_s=secs))
         print(rows[-1])
 
-        actual, seen = estop_test(link, d)
+        actual, seen = clean(link, lambda: estop_test(link, d))
         rows.append(dict(task="estop", delay_ms=ms, estop_stop_s=actual, estop_seen_s=seen,
                          false_hb_stops=len(comm_lost)))
         print(rows[-1])

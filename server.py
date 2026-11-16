@@ -1,7 +1,7 @@
 """Robot Server: TCP commands in, a robot in CoppeliaSim moves, feedback out.
 
 Protocol: one JSON object per line, every message has "ts" (time.time() when sent).
-Run:  python server.py [--port 5555] [--robot pioneer]
+Run:  python server.py [--port 5555] [--robot pioneer] [--scene open]
 """
 import argparse
 import json
@@ -14,6 +14,8 @@ import traceback
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
+import scenes
+
 TURN_W = 0.8            # rad/s used by left/right
 MAX_W = 2.0             # rad/s; much faster spins tip the robot over
 HEARTBEAT_TIMEOUT = 1.5 # s
@@ -21,9 +23,12 @@ LOOP_DT = 0.05          # control loop period (s)
 FEEDBACK_DT = 0.1       # feedback period (s)
 GOTO_TOL = 0.05         # m
 BRAKE_T = 0.6           # s; robot coasts ~0.5 m from 1.2 m/s, so check where it will be this far ahead
-SIM_TIMEOUT = 3.0       # s without a reply from CoppeliaSim = assume it crashed
+SIM_TIMEOUT = 30.0      # s without a reply from CoppeliaSim = assume it crashed (it can pause 10+ s after a scene build)
 CAMERA_FILL = 0.4       # after a robot switch, zoom so the robot fills this share of the view
 EDGE_GAP = 0.15         # extra gap (m) kept between the robot's body and the floor edge
+STOP_GAP = 0.12         # obstacle stop: brake when the gap ahead is below STOP_GAP + speed * STOP_T (m)
+STOP_T = 0.5            # s
+PERSON_GAP = 0.3        # extra gap (m) kept from people
 
 # Robots the operator can switch between. All are two-wheeled (differential drive), so they share one
 # command set. radius/axle were measured by driving each model in CoppeliaSim 4.10.
@@ -54,6 +59,35 @@ def wrap(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
+# Runs inside CoppeliaSim. Every remote call costs ~20 ms however small it is, so the control loop asks for
+# everything it needs in one call (one call also means pose and distances come from the same simulation step).
+HELPER = """
+function sysCall_init() end
+function teleopSense(left, right, body, rc, oc, pc, worker, wx, wy, wyaw)
+    if worker ~= -1 then
+        sim.setObjectPosition(worker, -1, {wx, wy, 0})
+        sim.setObjectOrientation(worker, -1, {0, 0, wyaw})
+    end
+    local out = {t = sim.getSimulationTime(), a = sim.getObjectPosition(left, -1), b = sim.getObjectPosition(right, -1),
+                 m = sim.getObjectMatrix(body, -1), running = sim.getSimulationState() ~= sim.simulation_stopped}
+    out.lin = sim.getObjectVelocity(body)
+    for i, c in ipairs({{oc, 1.5, 'o'}, {pc, 20, 'p'}}) do
+        if c[1] ~= -1 then
+            local hit, d, pair = sim.checkDistance(rc, c[1], c[2])
+            if hit == 1 then out[c[3] .. 'd'] = {d[4], d[5], d[7], pair[2]} end
+            local touch, tpair = sim.checkCollision(rc, c[1])
+            if touch == 1 then out[c[3] .. 't'] = tpair[2] end
+        end
+    end
+    return out
+end
+function teleopWheels(left, right, l, r)
+    sim.setJointTargetVelocity(left, l)
+    sim.setJointTargetVelocity(right, r)
+end
+"""
+
+
 class Robot:
     """Thin wrapper over the sim for one two-wheeled robot at a time.
     Every sim call goes through one lock (the ZMQ client is not thread-safe)."""
@@ -62,11 +96,32 @@ class Robot:
         self.lock = threading.Lock()
         self.sim = RemoteAPIClient().require("sim")
         self.models = self.sim.getStringParam(self.sim.stringparam_resourcesdir) + "/models/robots/mobile/"
+        self.scene, self.still, self.built = "open", False, None
+        self.rc = self.oc = self.pc = None
+        self.sim_t = 0.0   # simulation time at the last sense()
         self.stop_sim()
+        # Made while stopped: CoppeliaSim deletes whatever was added during a run when the run stops.
+        old = self.find("/TeleopHelper")
+        if old is not None:
+            self.sim.removeObjects([old])
+        self.helper = self.sim.createScript(self.sim.scripttype_customization, HELPER, 0, "lua")
+        self.sim.setObjectAlias(self.helper, "TeleopHelper")
+        for _ in range(100):   # CoppeliaSim starts a new script on its next pass
+            try:
+                self.sim.callScriptFunction("sysCall_init", self.helper)
+                break
+            except Exception:
+                time.sleep(0.05)
+        old = self.find("/Scene")   # left over from a server that didn't exit cleanly
+        if old is not None:
+            scenes.clear(self.sim, {"root": old})
+            self.sim.setModelProperty(self.sim.getObject("/Floor"), 0)
         # Use a robot already in the scene if there is one (and none was asked for), else load one.
         found = [k for k, r in ROBOTS.items() if self.find(r["base"]) is not None]
         if key is None and found:
             self.attach(found[0])
+            if old is not None:   # the robot is still where the old scene left it
+                self.place(*scenes.SCENES["open"]["start"])
         else:
             self.load(key or "pioneer")
         self.start_sim()
@@ -78,6 +133,7 @@ class Robot:
             return None
 
     def stop_sim(self):
+        self.wheels = None   # stopping puts the wheels back as they were saved
         self.sim.stopSimulation()
         while self.sim.getSimulationState() != self.sim.simulation_stopped:
             time.sleep(0.05)
@@ -104,20 +160,50 @@ class Robot:
         m = self.sim.getObjectMatrix(self.body, -1)
         self.up = max(range(3), key=lambda i: abs(m[8 + i]))
         self.up_sign = 1 if m[8 + self.up] > 0 else -1
-        # Safe area = floor minus the robot's size and a gap. Falls back to the default 5x5 m floor.
-        size = max(abs(self.sim.getObjectFloatParam(self.body, p)) for p in (
+        self.size = max(abs(self.sim.getObjectFloatParam(self.body, p)) for p in (
             self.sim.objfloatparam_modelbbox_min_x, self.sim.objfloatparam_modelbbox_max_x,
             self.sim.objfloatparam_modelbbox_min_y, self.sim.objfloatparam_modelbbox_max_y,
             self.sim.objfloatparam_modelbbox_min_z, self.sim.objfloatparam_modelbbox_max_z))
-        margin = size + EDGE_GAP
-        try:
-            box = self.sim.getObject("/Floor/box")
-            cx, cy, _ = self.sim.getObjectPosition(box, -1)
-            hx = self.sim.getObjectFloatParam(box, self.sim.objfloatparam_objbbox_max_x)
-            hy = self.sim.getObjectFloatParam(box, self.sim.objfloatparam_objbbox_max_y)
-        except Exception:
-            cx, cy, hx, hy = 0, 0, 2.5, 2.5
-        self.area = (cx - hx + margin, cx + hx - margin, cy - hy + margin, cy + hy - margin)
+        if self.rc is not None:
+            self.sim.destroyCollection(self.rc)
+        # The robot, for obstacle checks: its simple collision shapes only. With the detailed visual meshes
+        # CoppeliaSim can freeze for seconds working out distances.
+        shapes = self.sim.getObjectsInTree(self.body, self.sim.sceneobject_shape)
+        solid = [o for o in shapes if self.sim.getObjectInt32Param(o, self.sim.shapeintparam_respondable)] or shapes
+        self.rc = self.sim.createCollection(0)
+        for o in solid:
+            self.sim.setObjectSpecialProperty(o, self.sim.objectspecialproperty_collidable
+                                              | self.sim.objectspecialproperty_measurable)
+            self.sim.addItemToCollection(self.rc, self.sim.handle_single, o, 0)
+        self.set_area()
+
+    def set_area(self):
+        """Safe area = floor minus the robot's size and a gap. The open scene uses CoppeliaSim's default floor."""
+        margin = self.size + EDGE_GAP
+        floor = scenes.SCENES[self.scene]["floor"]
+        if floor:
+            x0, x1, y0, y1 = floor
+        else:
+            try:
+                box = self.sim.getObject("/Floor/box")
+                cx, cy, _ = self.sim.getObjectPosition(box, -1)
+                hx = self.sim.getObjectFloatParam(box, self.sim.objfloatparam_objbbox_max_x)
+                hy = self.sim.getObjectFloatParam(box, self.sim.objfloatparam_objbbox_max_y)
+            except Exception:
+                cx, cy, hx, hy = 0, 0, 2.5, 2.5
+            x0, x1, y0, y1 = cx - hx, cx + hx, cy - hy, cy + hy
+        self.area = (x0 + margin, x1 - margin, y0 + margin, y1 - margin)
+
+    def place(self, x, y, yaw_deg):
+        """Put the robot's wheel midpoint at (x, y) facing yaw_deg (simulation stopped)."""
+        a = self.sim.getObjectPosition(self.left, -1)
+        b = self.sim.getObjectPosition(self.right, -1)
+        cx, cy = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+        turn = math.radians(yaw_deg) - math.atan2(b[0] - a[0], a[1] - b[1])
+        m = self.sim.rotateAroundAxis(self.sim.getObjectMatrix(self.body, -1), [0, 0, 1], [cx, cy, 0], turn)
+        m[3] += x - cx
+        m[7] += y - cy
+        self.sim.setObjectMatrix(self.body, -1, m)
 
     def load(self, key):
         """Replace the current robot with a fresh `key` from CoppeliaSim's model library (simulation stopped)."""
@@ -125,6 +211,66 @@ class Robot:
             self.sim.removeModel(self.body)
         self.sim.loadModel(self.models + ROBOTS[key]["model"])
         self.attach(key)
+        self.place(*scenes.SCENES[self.scene]["start"])
+
+    def set_scene(self, key, still=False):
+        """Swap the surroundings for scene `key` and put the robot at its start. `still`: worker stands on the route."""
+        with self.lock:
+            self.stop_sim()
+            scenes.clear(self.sim, self.built)
+            for c in (self.oc, self.pc):
+                if c is not None:
+                    self.sim.destroyCollection(c)
+            self.scene, self.still = key, still
+            self.built = scenes.build(self.sim, key, still)
+            self.oc = self.pc = None
+            for want_person in (False, True):
+                shapes = [h for h, label in self.built["labels"].items() if (label == "person") == want_person]
+                if shapes:
+                    c = self.sim.createCollection(0)
+                    for h in shapes:
+                        self.sim.addItemToCollection(c, self.sim.handle_single, h, 0)
+                    if want_person:
+                        self.pc = c
+                    else:
+                        self.oc = c
+            self.place(*scenes.SCENES[key]["start"])
+            self.set_area()
+            self.start_sim()
+            try:
+                self.sim.cameraFitToView(0, [self.body] + list(self.built["labels"]), 0, 1)
+            except Exception:
+                pass
+
+    def sense(self):
+        """Everything the control loop needs, from one simulation step, in one call. Moves the walking worker first.
+        Returns (x, y, z, yaw, vx, vy, tipped, running), (nearest, person_gap, touching):
+        nearest = (gap m, x, y, label) of the closest obstacle or person within reach, person_gap = gap to the
+        nearest person (None if no one is around), touching = label of what the robot is in contact with."""
+        worker = (self.built or {}).get("worker") if not self.still else None
+        wx, wy, wyaw = (scenes.worker_at(self.scene, self.sim_t + LOOP_DT) or (0, 0, 0)) if worker else (0, 0, 0)
+        h = lambda c: -1 if c is None else c
+        with self.lock:
+            r = self.sim.callScriptFunction("teleopSense", self.helper, self.left, self.right, self.body, self.rc,
+                                            h(self.oc), h(self.pc), h(worker), wx, wy, wyaw)
+        self.sim_t = r["t"]
+        a, b, m, lin = r["a"], r["b"], r["m"], r["lin"]
+        x, y, z = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2
+        yaw = math.atan2(b[0] - a[0], a[1] - b[1])
+        pose = (x, y, z, yaw, lin[0], lin[1], self.up_sign * m[8 + self.up] < 0.5, r["running"])
+        labels = (self.built or {}).get("labels", {})
+        nearest = person = touching = None
+        for k in ("od", "pd"):
+            if k in r:
+                ox, oy, gap, other = r[k]
+                if k == "pd":
+                    person = gap
+                if nearest is None or gap < nearest[0]:
+                    nearest = (gap, ox, oy, labels.get(other, "obstacle"))
+        for k in ("ot", "pt"):
+            if k in r:
+                touching = labels.get(r[k], "obstacle")
+        return pose, (nearest, person, touching)
 
     def switch(self, key):
         with self.lock:
@@ -158,9 +304,12 @@ class Robot:
         r, axle, max_v = self.spec["radius"], self.spec["axle"], self.spec["max_v"]
         v = max(-max_v, min(max_v, v))
         w = max(-MAX_W, min(MAX_W, w))
+        wheels = ((v - w * axle / 2) / r, (v + w * axle / 2) / r)
+        if wheels == self.wheels:   # unchanged: save a ~20 ms call to CoppeliaSim
+            return
         with self.lock:
-            self.sim.setJointTargetVelocity(self.left, (v - w * axle / 2) / r)
-            self.sim.setJointTargetVelocity(self.right, (v + w * axle / 2) / r)
+            self.sim.callScriptFunction("teleopWheels", self.helper, self.left, self.right, *wheels)
+        self.wheels = wheels
 
     def pose(self):
         """(x, y, z, yaw, vx, vy, tipped, running) in world frame.
@@ -207,6 +356,11 @@ class Server:
         self.estop_ts = None           # when estop was handled
         self.estop_stopped_ts = None   # when robot actually came to rest after estop
         self.run = 0                   # bumped on every sim restart, so clients can drop stale feedback
+        # Safety features. All on in normal use; the ablation study turns one off at a time ('safety latch off').
+        self.safety = {"watchdog": True, "latch": True, "autostop": True}
+        self.hits = self.person_hits = self.autostops = 0
+        self.stalls, self.prev_tick = 0, time.time()   # times CoppeliaSim froze the loop > 0.5 s
+        self.touching, self.person_gap, self.last_block = (None, 0), None, (None, 0)
 
     # ---- outgoing ----
     def send(self, msg):
@@ -263,6 +417,10 @@ class Server:
         name, args = parts[0].lower(), parts[1:]
         if name == "robot":   # takes a name, not numbers
             return self.robot_command(args)
+        if name == "scene":
+            return self.scene_command(args)
+        if name == "safety":
+            return self.safety_command(args)
         try:
             nums = [float(a) for a in args]
         except ValueError:
@@ -273,6 +431,10 @@ class Server:
             if self.state == ESTOP:
                 return self.say("Emergency stop is already on. Type 'reset' to release it.")
             self.estop_ts, self.estop_stopped_ts = time.time(), None
+            if not self.safety["latch"]:
+                self.halt(IDLE)
+                return self.say(f"EMERGENCY STOP at {self.here()}. The lock is turned off (study mode), so the "
+                                "next movement command will move the robot again.", "estop")
             self.halt(ESTOP)
             return self.say(f"EMERGENCY STOP. The robot is stopped and locked at {self.here()}. "
                             "Movement commands will be ignored until you type 'reset'.", "estop")
@@ -290,16 +452,10 @@ class Server:
         if name == "status":
             return self.say(self.status())
         if name == "restart":
-            self.motion = None
+            self.halt(IDLE)
             self.robot.restart()
-            self.last_tick = time.time()
-            self.estop_ts = self.estop_stopped_ts = None
-            self.fell, self.sim_stopped = None, False
-            self.run += 1
-            self.set_state(IDLE)
-            x, y, _, yaw, *_ = self.robot.pose()
-            self.pose = (x, y, yaw)
-            return self.say(f"Simulation restarted. The robot is back at its start position {self.here()}.")
+            self.fresh()
+            return self.say(f"Simulation restarted. The robot is back at its start position {self.here()}.", "restarted")
 
         # Movement commands.
         usage = {"forward": "forward 0.3", "back": "back 0.3", "left": "left 90", "right": "right 90",
@@ -363,14 +519,55 @@ class Server:
             return self.say("The emergency stop is on. Type 'reset' before switching robots.")
         self.halt(IDLE)
         self.robot.switch(key)
+        self.fresh()
+        self.say(f"Switched to the {self.robot.spec['name']}. It is stopped at {self.here()}.")
+        self.send_help()
+
+    def scene_command(self, args):
+        if not args:
+            names = " ".join(f"{k} ({s['name']}: {s['about']})." for k, s in scenes.SCENES.items())
+            return self.say(f"You are in the {scenes.SCENES[self.robot.scene]['name']}. Scenes: {names} "
+                            "Type 'scene <name>' to switch, e.g. 'scene plant'. "
+                            "Add 'still' to make the worker stand still in the robot's path.")
+        key = args[0].lower()
+        if key not in scenes.SCENES:
+            return self.say(f"There is no scene called '{key}'. Type 'scene' to see the list.")
+        if self.state == ESTOP:
+            return self.say("The emergency stop is on. Type 'reset' before switching scenes.")
+        still = args[1:] == ["still"]
+        self.halt(IDLE)
+        self.robot.set_scene(key, still)
+        self.fresh()
+        s = scenes.SCENES[key]
+        self.say(f"Now in the {s['name']}: {s['about']}."
+                 + (" The worker is standing still in the robot's path." if still and s["still"] else "")
+                 + f" The robot is stopped at {self.here()}.", "scene")
+        self.send_help()
+
+    def safety_command(self, args):
+        about = {"watchdog": "stops the robot when the operator's signal is lost",
+                 "latch": "keeps the robot locked after an emergency stop until 'reset'",
+                 "autostop": "brakes by itself before hitting walls or people, or driving off the floor"}
+        if len(args) != 2 or args[0] not in about or args[1] not in ("on", "off"):
+            state = "; ".join(f"{k} is {'ON' if self.safety[k] else 'OFF'} ({about[k]})" for k in about)
+            return self.say(f"Safety features: {state}. For the study only: 'safety latch off' turns one off, "
+                            "'safety latch on' turns it back on.")
+        self.safety[args[0]] = args[1] == "on"
+        warn = "" if args[1] == "on" else " WARNING: the robot is less safe until you turn it back on."
+        self.say(f"Safety feature '{args[0]}' is now {args[1].upper()}.{warn}", "safety")
+
+    def fresh(self):
+        """After a restart or a switch: forget everything about the previous run."""
         self.last_tick = time.time()
         self.estop_ts = self.estop_stopped_ts = None
         self.fell, self.sim_stopped = None, False
+        self.hits = self.person_hits = self.autostops = 0
+        self.stalls, self.prev_tick = 0, time.time()   # times CoppeliaSim froze the loop > 0.5 s
+        self.touching, self.last_block = (None, 0), (None, 0)
         self.run += 1
+        self.set_state(IDLE)
         x, y, _, yaw, *_ = self.robot.pose()
         self.pose = (x, y, yaw)
-        self.say(f"Switched to the {self.robot.spec['name']}. It is stopped at {self.here()}.")
-        self.send_help()
 
     def send_help(self):
         """The command list depends on the robot, so the server tells the client what to show."""
@@ -387,9 +584,12 @@ class Server:
             "reset            release the emergency stop",
             "status           where the robot is and what it is doing",
             "robot            list robots; 'robot epuck' switches to another one",
+            "scene            list places; 'scene plant' moves the robot to the chemical plant",
+            "safety           show the safety features (the study can turn them off one at a time)",
             "restart          restart the simulation, robot back at its start",
         ]
-        self.send({"type": "help", "robot": r["name"], "lines": lines})
+        self.send({"type": "help", "robot": f"{r['name']} in the {scenes.SCENES[self.robot.scene]['name']}",
+                   "lines": lines})
 
     def status(self):
         x, y, _, yaw, vx, vy, *_ = self.robot.pose()
@@ -397,9 +597,12 @@ class Server:
         what = {IDLE: "stopped", MOVING: "moving", COMM_LOST: "stopped because the connection dropped",
                 ESTOP: "stopped and locked by the emergency stop (type 'reset' to release)"}[self.state]
         if self.fell:
-            what = f"{self.fell} (type 'restart')"
-        return (f"The robot is {what}, at {at(x, y)}, {facing(yaw)}, speed {math.hypot(vx, vy):.2f} m/s. "
-                f"Safe area: x {x0:.1f} to {x1:.1f}, y {y0:.1f} to {y1:.1f}.")
+            what = f"down: it {self.fell} (type 'restart')"
+        off = [k for k, on in self.safety.items() if not on]
+        return (f"The robot is {what}, at {at(x, y)}, {facing(yaw)}, speed {math.hypot(vx, vy):.2f} m/s, "
+                f"in the {scenes.SCENES[self.robot.scene]['name']}. "
+                f"Safe area: x {x0:.1f} to {x1:.1f}, y {y0:.1f} to {y1:.1f}."
+                + (f" Safety features turned OFF: {', '.join(off)}." if off else ""))
 
     # ---- control loop: watchdog, motion execution, feedback ----
     def loop(self):
@@ -412,19 +615,30 @@ class Server:
                 if now >= next_fb:
                     self.send(fb)
                     next_fb = now + FEEDBACK_DT
-                time.sleep(LOOP_DT)
+                time.sleep(max(0.0, now + LOOP_DT - time.time()))
         except Exception:
             self.die("The robot server hit an internal error and is shutting down:\n" + traceback.format_exc())
 
     def tick(self, now):
-        if self.state not in (COMM_LOST, ESTOP) and now - self.last_hb > HEARTBEAT_TIMEOUT:
+        if now - self.prev_tick > 0.5:
+            self.stalls += 1
+            log(f"control loop held up {now - self.prev_tick:.1f} s by CoppeliaSim")
+        self.prev_tick = now
+        if self.safety["watchdog"] and self.state not in (COMM_LOST, ESTOP) and now - self.last_hb > HEARTBEAT_TIMEOUT:
             self.halt(COMM_LOST)
             self.say(f"No signal from the operator for {HEARTBEAT_TIMEOUT} s, so the robot stopped itself at {self.here()}.",
                      "comm_lost")
-        x, y, z, yaw, vx, vy, tipped, running = self.robot.pose()
+        (x, y, z, yaw, vx, vy, tipped, running), (nearest, self.person_gap, touching) = self.robot.sense()
         self.last_tick = time.time()
         speed = math.hypot(vx, vy)
         self.pose = (x, y, yaw)
+        # One scrape flickers in and out of contact, so a new hit needs 2 s without touching that thing first.
+        if touching and (touching != self.touching[0] or now - self.touching[1] > 2):
+            self.hits += 1
+            self.person_hits += touching == "person"
+            self.say(f"The robot hit the {touching} at {at(x, y)}.", "hit")
+        if touching:
+            self.touching = (touching, now)
         if not running and not self.sim_stopped:
             self.sim_stopped = True
             self.motion = None
@@ -435,15 +649,33 @@ class Server:
             self.halt(IDLE)
             self.say(f"The robot {self.fell} at {at(x, y)}. Type 'restart' to put it back at the start.")
         # Look ahead by the braking time so fast driving stops in time too.
-        elif self.state == MOVING and self.robot.heading_out(x + vx * BRAKE_T, y + vy * BRAKE_T, vx, vy):
+        elif self.safety["autostop"] and self.state == MOVING and \
+                self.robot.heading_out(x + vx * BRAKE_T, y + vy * BRAKE_T, vx, vy):
             self.halt(IDLE)
-            self.say(f"Stopped at {at(x, y)}: the robot reached the edge of the floor. Back up or turn around.")
-        if self.state == ESTOP and self.estop_stopped_ts is None and speed < 0.05:
+            self.block("edge", f"Stopped at {at(x, y)}: the robot reached the edge of the floor. Back up or turn around.")
+        elif self.safety["autostop"] and self.state == MOVING and nearest and blocked(x, y, vx, vy, nearest):
+            gap, _, _, label = nearest
+            if self.motion[0] in ("vel", "turn") and self.motion[2]:   # turning: stop rolling, keep turning
+                self.motion = (self.motion[0], 0.0) + self.motion[2:]
+            else:
+                self.halt(IDLE)
+            self.block(label, f"Stopped at {at(x, y)}: {label} {gap:.2f} m ahead. Turn away or back up.")
+        if self.estop_ts and self.estop_stopped_ts is None and speed < 0.05:
             self.estop_stopped_ts = now
         if self.state == MOVING:
             self.step(x, y, yaw)
         return {"type": "fb", "x": x, "y": y, "yaw": yaw, "speed": speed, "state": self.state,
-                "run": self.run, "estop_ts": self.estop_ts, "estop_stopped_ts": self.estop_stopped_ts}
+                "run": self.run, "estop_ts": self.estop_ts, "estop_stopped_ts": self.estop_stopped_ts,
+                "hits": self.hits, "person_hits": self.person_hits, "person_gap": self.person_gap,
+                "autostops": self.autostops, "fell": self.fell, "stalls": self.stalls}
+
+    def block(self, what, text):
+        """Tell the operator about an automatic stop, but not again for the same thing within 2 s
+        (a stream of drive commands would otherwise repeat it ten times a second)."""
+        self.autostops += 1
+        if self.last_block[0] != what or time.time() - self.last_block[1] > 2:
+            self.say(text, "autostop")
+        self.last_block = (what, time.time())
 
     def step(self, x, y, yaw):
         kind = self.motion[0]
@@ -466,7 +698,7 @@ class Server:
             v, w, done = goto_control(x, y, yaw, tx, ty, min(0.4, self.robot.spec["max_v"]))
             if done:
                 self.halt(IDLE)
-                self.say(f"Arrived at {at(tx, ty)} ({math.hypot(tx - x, ty - y) * 100:.0f} cm off target).")
+                self.say(f"Arrived at {at(tx, ty)} ({math.hypot(tx - x, ty - y) * 100:.0f} cm off target).", "arrived")
             else:
                 self.robot.drive(v, w)
 
@@ -474,8 +706,12 @@ class Server:
     def sim_watchdog(self):
         """The ZMQ client waits forever if CoppeliaSim dies, which freezes the control loop silently.
         Notice the freeze from this separate thread and shut down loudly instead."""
+        slow = False
         while True:
             time.sleep(0.5)
+            if time.time() - self.last_tick > 1.5 and not slow:
+                log(f"CoppeliaSim has not answered for {time.time() - self.last_tick:.1f} s")
+            slow = time.time() - self.last_tick > 1.5
             if time.time() - self.last_tick > SIM_TIMEOUT:
                 self.die(f"No answer from CoppeliaSim for {SIM_TIMEOUT:.0f} s. It probably crashed or was closed.")
 
@@ -521,6 +757,16 @@ class Server:
                 # The heartbeat watchdog will stop the robot.
 
 
+def blocked(x, y, vx, vy, nearest):
+    """True if the robot is driving toward `nearest` (gap, ox, oy, label) and too close to brake in time."""
+    gap, ox, oy, label = nearest
+    speed = math.hypot(vx, vy)
+    if speed < 0.02:
+        return False
+    ahead = math.cos(math.atan2(oy - y, ox - x) - math.atan2(vy, vx)) > 0.866   # within 30 degrees of travel
+    return ahead and gap < STOP_GAP + speed * STOP_T + (PERSON_GAP if label == "person" else 0)
+
+
 def goto_control(x, y, yaw, tx, ty, v_max=0.4):
     """Point-to-point P controller. Returns (v, w, done). Shared with study.py."""
     dx, dy = tx - x, ty - y
@@ -537,6 +783,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=5555)
     p.add_argument("--robot", choices=ROBOTS, help="robot to load (default: the one in the scene, else pioneer)")
+    p.add_argument("--scene", choices=scenes.SCENES, default="open", help="place to start in")
     a = p.parse_args()
     try:   # RemoteAPIClient would hang forever if CoppeliaSim isn't running, so check first
         socket.create_connection(("127.0.0.1", 23000), timeout=2).close()
@@ -548,6 +795,8 @@ if __name__ == "__main__":
         raise SystemExit(f"Port {a.port} is already in use: another server.py is probably still running. "
                          f"Close it (Ctrl-C in its window, or: pkill -f server.py) and try again.")
     server = Server(Robot(a.robot))
+    if a.scene != "open":
+        server.robot.set_scene(a.scene)
     threading.Thread(target=server.loop, daemon=True).start()
     threading.Thread(target=server.sim_watchdog, daemon=True).start()
     try:
